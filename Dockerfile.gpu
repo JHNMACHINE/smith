@@ -33,11 +33,14 @@ ARG MOONCLIP_VERSION=0.1.3
 ARG RAVEX_VERSION=0.4.0
 RUN pip download --no-deps --only-binary=:all: -d /wheels \
       "moonclip==${MOONCLIP_VERSION}" "ravex==${RAVEX_VERSION}"
-# The scripts smith.gpu.toml offers are Ravex's examples, which the wheel does
-# not carry: taken from the release's tag, so they match the library.
+# The scripts smith.gpu.toml offers are Ravex's examples and GPU benches, which
+# the wheel does not carry: taken from the release's tag, so they match the
+# library. A bench newer than the release is not there, and a job naming it
+# fails at start saying so.
 RUN curl -fsSL "https://github.com/JHNMACHINE/ravex/archive/refs/tags/v${RAVEX_VERSION}.tar.gz" \
       | tar -xz -C /tmp \
-    && mv "/tmp/ravex-${RAVEX_VERSION}/examples" /examples
+    && mv "/tmp/ravex-${RAVEX_VERSION}/examples" /examples \
+    && mv "/tmp/ravex-${RAVEX_VERSION}/bench" /bench
 
 # ─── wheels: from checkouts ────────────────────────────────────────────
 FROM python:3.12-bookworm AS wheels-source
@@ -60,7 +63,7 @@ COPY --from=ravex . /src/ravex
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/src/ravex/target \
     maturin build --release --locked -m /src/ravex/Cargo.toml --out /wheels \
-    && cp -r /src/ravex/examples /examples
+    && cp -r /src/ravex/examples /examples && cp -r /src/ravex/bench /bench
 
 FROM wheels-${LIBS} AS wheels
 
@@ -123,6 +126,7 @@ RUN pip install /wheels/*.whl && rm -rf /wheels
 
 # The scripts smith.gpu.toml offers. Sources, if any, stayed in their stage.
 COPY --from=wheels /examples /app/examples
+COPY --from=wheels /bench /app/bench
 COPY . /app/smith
 WORKDIR /app
 
