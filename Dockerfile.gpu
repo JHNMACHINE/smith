@@ -1,0 +1,129 @@
+# syntax=docker/dockerfile:1
+#
+# smith for a provider's GPU node: the same agent as Dockerfile,
+# with CUDA torch and the NVIDIA management library, so a job asking for a GPU
+# gets one and Ravex can sample it.
+#
+#   docker build -f Dockerfile.gpu -t smith-gpu .
+#
+# Moonclip and Ravex from PyPI by default, or compiled from checkouts with
+# LIBS=source and the two contexts, as in Dockerfile:
+#
+#   docker build -f Dockerfile.gpu -t smith-gpu --build-arg LIBS=source \
+#     --build-context moonclip=../moonclip --build-context ravex=../ravex .
+#
+# and run on a node with the NVIDIA container toolkit:
+#
+#   docker run --gpus all --init \
+#     -e SMITH_BACKEND=https://... -e SMITH_TOKEN=... \
+#     -e SMITH_HARDWARE=gpu-a100 \
+#     -e SMITH_STORAGE_BUCKET=... -e SMITH_STORAGE_ENDPOINT=https://<account>.r2.cloudflarestorage.com \
+#     -e RAVEX_S3_ACCESS_KEY=... -e RAVEX_S3_SECRET_KEY=... \
+#     smith-gpu
+#
+# Either way the libraries arrive as wheels made in a stage of their own, so
+# the compiler a source build needs stays behind: a rented node pulls this
+# image before it can do anything, and a Rust toolchain is a gigabyte it would
+# pull for nothing.
+ARG LIBS=pypi
+
+# ─── wheels: from PyPI ─────────────────────────────────────────────────
+FROM python:3.12-bookworm AS wheels-pypi
+ARG MOONCLIP_VERSION=0.1.3
+ARG RAVEX_VERSION=0.4.0
+RUN pip download --no-deps --only-binary=:all: -d /wheels \
+      "moonclip==${MOONCLIP_VERSION}" "ravex==${RAVEX_VERSION}"
+# The scripts smith.gpu.toml offers are Ravex's examples, which the wheel does
+# not carry: taken from the release's tag, so they match the library.
+RUN curl -fsSL "https://github.com/JHNMACHINE/ravex/archive/refs/tags/v${RAVEX_VERSION}.tar.gz" \
+      | tar -xz -C /tmp \
+    && mv "/tmp/ravex-${RAVEX_VERSION}/examples" /examples
+
+# ─── wheels: from checkouts ────────────────────────────────────────────
+FROM python:3.12-bookworm AS wheels-source
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PATH="/root/.cargo/bin:${PATH}"
+
+# The version both libraries pin in their rust-toolchain.toml (see Dockerfile).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --component clippy \
+    && pip install maturin
+
+COPY --from=moonclip . /src/moonclip
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/src/moonclip/target \
+    maturin build --release --locked -m /src/moonclip/Cargo.toml --out /wheels
+
+COPY --from=ravex . /src/ravex
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/src/ravex/target \
+    maturin build --release --locked -m /src/ravex/Cargo.toml --out /wheels \
+    && cp -r /src/ravex/examples /examples
+
+FROM wheels-${LIBS} AS wheels
+
+# ─── run: what the node pulls ──────────────────────────────────────────
+# Slim Python rather than a CUDA base image: torch's CUDA wheels carry their
+# own CUDA libraries, and all the node has to provide is the driver, which the
+# container toolkit mounts in. One interpreter, the one the wheels were built
+# for, instead of a CUDA image's and a second one beside it.
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+# CUDA 12.8: the oldest line with Blackwell kernels, and it runs on the 570
+# drivers most rented nodes still have. **The cu128 index alone**, not paired
+# with PyPI as the CPU image does: PyPI's own torch is newer and built for
+# CUDA 13, pip takes the highest version across indexes, and the first build
+# of this image came out 2.14+cu130 - which needs a 580 driver and would not
+# see the GPU on half the nodes it was meant for. This index carries torch's
+# dependencies as well, so nothing is missing without PyPI.
+#
+# **In layers of about a gigabyte, not one of seven.** torch with CUDA is
+# ~7 GB, nearly all of it NVIDIA libraries, and as one layer it travels as one
+# blob: a push that dropped at 90% started over (it did, through Docker
+# Desktop's proxy), and a node pulled and unpacked it on one thread. Split,
+# pushes and pulls run in parallel and a failure costs one layer. Each group
+# goes in with --no-deps so it lands in its own layer; torch last, when
+# everything it needs is already there, and `pip check` proves nothing is
+# missing. The versions are the ones torch 2.11.0+cu128 resolved to on
+# 2026-09-25 - move them together with torch. Largest first, as measured.
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ARG PIP_GROUP="pip install --no-deps --index-url ${TORCH_INDEX}"
+# cuDNN, 951 MB
+RUN ${PIP_GROUP} nvidia-cudnn-cu12==9.19.0.56
+# cuBLAS and NVRTC, 1.04 GB
+RUN ${PIP_GROUP} nvidia-cublas-cu12==12.8.4.1 nvidia-cuda-nvrtc-cu12==12.8.93
+# NCCL, cuSPARSE, cuFFT, 1.02 GB
+RUN ${PIP_GROUP} nvidia-nccl-cu12==2.28.9 nvidia-cusparse-cu12==12.5.8.93 nvidia-cufft-cu12==11.3.3.83
+# cuSPARSELt and cuSOLVER, 820 MB
+RUN ${PIP_GROUP} nvidia-cusparselt-cu12==0.7.1 nvidia-cusolver-cu12==11.7.3.90
+# The rest of NVIDIA's, 470 MB
+RUN ${PIP_GROUP} nvidia-nvshmem-cu12==3.4.5 nvidia-curand-cu12==10.3.9.90 \
+      nvidia-nvjitlink-cu12==12.8.93 nvidia-cuda-cupti-cu12==12.8.90 \
+      nvidia-cuda-runtime-cu12==12.8.90 nvidia-cufile-cu12==1.13.1.3 nvidia-nvtx-cu12==12.8.90
+# triton and the small pure-Python ones, 800 MB
+RUN ${PIP_GROUP} triton==3.6.0 numpy==2.5.2 sympy==1.14.0 mpmath==1.3.0 networkx==3.6.1 \
+      jinja2==3.1.6 markupsafe==3.0.3 filelock==3.32.3 fsspec==2026.7.0 typing-extensions==4.16.0
+# torch, 1.6 GB - and nothing else, or a version above has drifted.
+RUN pip install --index-url ${TORCH_INDEX} torch==2.11.0+cu128 \
+    && pip check \
+    && python -c "import torch; assert torch.version.cuda == '12.8', torch.version.cuda"
+
+# psutil for CPU and RAM, nvidia-ml-py (imported as pynvml) for the GPUs:
+# Ravex samples each only if it is importable, and says nothing otherwise.
+RUN pip install psutil nvidia-ml-py
+
+COPY --from=wheels /wheels /wheels
+RUN pip install /wheels/*.whl && rm -rf /wheels
+
+# The scripts smith.gpu.toml offers. Sources, if any, stayed in their stage.
+COPY --from=wheels /examples /app/examples
+COPY . /app/smith
+WORKDIR /app
+
+CMD ["python", "smith/smith.py", "--config", "smith/smith.gpu.toml"]

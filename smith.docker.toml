@@ -1,0 +1,19 @@
+# smith in a container on CPU (Dockerfile). smith.toml beside this is the
+# same agent run on the host.
+#
+# Paths are absolute here because they are the image's layout (see the
+# Dockerfile), not a checkout's.
+
+# The backend by its name on a compose network. Ravex is handed the same
+# address to send the run's metrics to. SMITH_BACKEND overrides it.
+backend = "http://backend:8600"
+name = "docker"
+hardware = "local-cpu"
+# The runs volume: one store per run, plus _logs/.
+runs = "/runs"
+
+[scripts]
+# `model`: the parameters that change the model itself. A run cannot carry on
+# from its checkpoint with one of them changed - the weights no longer fit -
+# so the backend offers a run from scratch instead of save or fork.
+spiral = { path = "/app/examples/spiral.py", model = ["width"] }

@@ -1,0 +1,21 @@
+# smith on this machine: what it may run, and where the runs go.
+#
+#   ../ravex/.venv/Scripts/python smith.py
+#
+# Paths are relative to this file; the ones below assume a ravex checkout
+# beside smith's. A job names one of the scripts below by its key and nothing
+# else - see smith.py for why.
+
+backend = "http://127.0.0.1:8600"
+hardware = "local-cpu"
+# One store per run is made here, plus _logs/ with each job's output.
+runs = "runs"
+# The interpreter for the scripts. Default: the one running smith, which is
+# why it is started from the training environment's venv.
+# python = "../ravex/.venv/Scripts/python.exe"
+
+[scripts]
+# `model`: the parameters that change the model itself. A run cannot carry on
+# from its checkpoint with one of them changed - the weights no longer fit -
+# so the backend offers a run from scratch instead of save or fork.
+spiral = { path = "../ravex/examples/spiral.py", model = ["width"] }

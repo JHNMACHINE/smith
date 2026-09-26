@@ -1,0 +1,26 @@
+# smith in Dockerfile.gpu, on a provider's GPU node.
+#
+# One file for every node: what differs between them - the backend's address,
+# the node's name and card, the bucket - comes from the environment (see
+# smith.py), and so do the secrets, which never go in a file:
+# SMITH_TOKEN, RAVEX_S3_ACCESS_KEY, RAVEX_S3_SECRET_KEY.
+
+backend = "http://127.0.0.1:8600"
+# What a job asks for to land here. Set SMITH_HARDWARE to the card -
+# gpu-a100, gpu-h100 - so a job for one does not go to the other.
+hardware = "gpu"
+# Staging for the stores, which live in the bucket; and _logs/.
+runs = "/runs"
+
+# The bucket every run's store goes to, under <prefix>/<run id>. A pod is gone
+# once it stops, and the bucket is what lets a run resume or fork on another.
+# The bucket and endpoint come from SMITH_STORAGE_BUCKET and
+# SMITH_STORAGE_ENDPOINT; without them the agent keeps the stores on the
+# pod's disk, which is only fine for trying the image out.
+# [storage]
+# type = "r2"
+# prefix = "runs"
+
+[scripts]
+# `model`: the parameters that change the model itself (see smith.docker.toml).
+spiral = { path = "/app/examples/spiral.py", model = ["width"] }

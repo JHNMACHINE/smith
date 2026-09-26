@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # smith is standard library only: it has to compile and start on the
+      # oldest Python it claims, with nothing installed.
+      - run: python -m py_compile smith.py
+      - run: python smith.py --help
+      - name: Every config parses
+        run: |
+          python - <<'EOF'
+          import glob, tomllib
+          for path in sorted(glob.glob("smith*.toml")):
+              with open(path, "rb") as handle:
+                  config = tomllib.load(handle)
+              assert config.get("scripts"), path
+              print("ok", path)
+          EOF
+
+  image:
+    # The CPU image from PyPI: proves the repository builds on its own, without
+    # any checkout of the libraries. The GPU image is the same recipe with gigabytes more
+    # torch, so it is left to whoever pushes it to a registry.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: smith:ci
+      - name: The libraries import, and the examples are where the config says
+        run: |
+          docker run --rm smith:ci python -c "import moonclip, ravex; print(ravex.__version__)"
+          docker run --rm smith:ci test -f /app/examples/spiral.py
