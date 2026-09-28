@@ -16,4 +16,6 @@ runs = "/runs"
 # `model`: the parameters that change the model itself. A run cannot carry on
 # from its checkpoint with one of them changed - the weights no longer fit -
 # so the backend offers a run from scratch instead of save or fork.
-spiral = { path = "/app/examples/spiral.py", model = ["width"] }
+# `params`: what a job starts from, filled into the Launch page when the
+# script is picked. Only flags the script takes: the form sends them as-is.
+spiral = { path = "/app/examples/spiral.py", model = ["width"], params = { lr = 5e-3, steps = 3000 } }

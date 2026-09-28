@@ -143,6 +143,11 @@ class Config:
     #: one, so the backend refuses to "save" or fork with it changed and
     #: offers a run from scratch instead. Only the script knows which they are.
     model_params: Dict[str, List[str]] = field(default_factory=dict)
+    #: Per script, the parameters a job starts from, with their values: what
+    #: the Launch page fills in when the script is picked. Only the script
+    #: knows which flags it takes, and a form still holding another script's
+    #: would start a job that dies on its first line (GPU-172).
+    params: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     #: The backend's bearer token for agents and runs; None when it asks none.
     token: Optional[str] = None
     #: The bucket runs keep their stores in; None keeps them on this disk.
@@ -162,6 +167,7 @@ class Config:
 
         scripts: Dict[str, str] = {}
         model_params: Dict[str, List[str]] = {}
+        params: Dict[str, Dict[str, Any]] = {}
         for key, entry in (raw.get("scripts") or {}).items():
             script = entry.get("path") if isinstance(entry, dict) else entry
             if not script:
@@ -171,6 +177,10 @@ class Config:
                 raise SystemExit("scripts.%s: %s does not exist" % (key, resolved))
             scripts[key] = resolved
             model_params[key] = [str(name) for name in (entry.get("model") or [])] if isinstance(entry, dict) else []
+            given = entry.get("params") if isinstance(entry, dict) else None
+            if given is not None and not isinstance(given, dict):
+                raise SystemExit("scripts.%s.params is not a table" % key)
+            params[key] = dict(given or {})
         if not scripts:
             raise SystemExit("%s names no scripts; there would be nothing to run" % path)
         # The environment wins over the file for what differs between machines
@@ -191,6 +201,7 @@ class Config:
             python=raw.get("python") or sys.executable,
             scripts=scripts,
             model_params=model_params,
+            params=params,
             token=os.environ.get("SMITH_TOKEN") or raw.get("token") or None,
             storage=storage,
         )
@@ -537,6 +548,7 @@ class Agent:
                 "agent": self.config.name,
                 "scripts": sorted(self.config.scripts),
                 "model_params": self.config.model_params,
+                "params": self.config.params,
                 "hardware": self.config.hardware,
                 "host": socket.gethostname(),
                 "job_id": self.current.id if self.current else None,

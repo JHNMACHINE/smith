@@ -22,8 +22,8 @@ runs = "/runs"
 # prefix = "runs"
 
 [scripts]
-# `model`: the parameters that change the model itself (see smith.docker.toml).
-spiral = { path = "/app/examples/spiral.py", model = ["width"] }
+# `model` and `params`: see smith.docker.toml.
+spiral = { path = "/app/examples/spiral.py", model = ["width"], params = { lr = 5e-3, steps = 3000 } }
 # What log_metrics costs a step on this card: ravex's bench, printed to the
 # job's output. Not a training run - it makes one small store per arm.
-metrics_cost = { path = "/app/bench/metrics_cost.py" }
+metrics_cost = { path = "/app/bench/metrics_cost.py", params = { steps = 600 } }
