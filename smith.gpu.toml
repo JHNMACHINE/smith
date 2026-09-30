@@ -27,3 +27,7 @@ spiral = { path = "/app/examples/spiral.py", model = ["width"], params = { lr = 
 # What log_metrics costs a step on this card: ravex's bench, printed to the
 # job's output. Not a training run - it makes one small store per arm.
 metrics_cost = { path = "/app/bench/metrics_cost.py", params = { steps = 600 } }
+# What quantizing an outer delta costs on this card - torch on CPU, torch on
+# CUDA, and ravex's TileLang kernel - after checking the kernel writes the
+# torch path's bytes (GPU-139). Prints CHECK OK or CHECK FAILED first.
+quant_cost = { path = "/app/bench/quant_cost.py", params = { elements = 67108864, repeat = 3 } }
