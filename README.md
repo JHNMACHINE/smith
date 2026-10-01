@@ -44,6 +44,12 @@ JSON over HTTP, with `Authorization: Bearer <SMITH_TOKEN>` when a token is set:
 | `POST /api/jobs/{id}/logs` | the job's output, numbered line by line |
 | `GET /api/jobs` | at start, jobs this node left running before a restart |
 
+A claimed job may carry `secrets`, an object of names and values - an
+`HF_TOKEN`, a W&B key. smith puts them in that job's process environment only,
+never its own, and never one named `RAVEX_*` or `SMITH_*`; and it replaces
+their values with `[secret NAME]` in the output lines and failure messages it
+sends back.
+
 The runs are [Ravex](https://github.com/JHNMACHINE/ravex) scripts: smith hands
 them their store, name and the backend's address through `RAVEX_*` variables,
 and ships what a finished run could not send with `ravex ship`.

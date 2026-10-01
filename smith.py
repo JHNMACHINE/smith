@@ -321,6 +321,29 @@ def flags(params: Dict[str, Any]) -> List[str]:
     return out
 
 
+def redact(text: str, secrets: Dict[str, str]) -> str:
+    """``text`` with each secret's value replaced by its name, the longest
+    first so a value that contains another is not half replaced."""
+    for name, value in sorted(secrets.items(), key=lambda item: -len(item[1])):
+        if value and value in text:
+            text = text.replace(value, "[secret %s]" % name)
+    return text
+
+
+def job_secrets(job: Dict[str, Any]) -> Dict[str, str]:
+    """The secrets a backend gave this job: names and values for its
+    process's environment. A name smith sets itself is dropped rather than
+    let a secret replace the run's own settings."""
+    given = job.get("secrets")
+    if not isinstance(given, dict):
+        return {}
+    return {
+        str(name): str(value)
+        for name, value in given.items()
+        if not str(name).startswith(("RAVEX_", "SMITH_"))
+    }
+
+
 class LogTail:
     """A job's output file, followed and sent to the backend.
 
@@ -331,9 +354,11 @@ class LogTail:
     end of the job, when whatever is there is the last line.
     """
 
-    def __init__(self, job_id: int, path: str) -> None:
+    def __init__(self, job_id: int, path: str, secrets: Optional[Dict[str, str]] = None) -> None:
         self.job_id = job_id
         self.path = path
+        #: Values that must not leave this machine in a log line.
+        self.secrets = secrets or {}
         self.offset = 0
         self.line = 0
         #: The process has exited: nothing more will be written.
@@ -355,6 +380,8 @@ class LogTail:
         if not complete:
             return not full
         lines = complete.decode("utf-8", "replace").splitlines()
+        if self.secrets:
+            lines = [redact(line, self.secrets) for line in lines]
         for first in range(0, len(lines), LOG_BATCH):
             backend.call(
                 "POST",
@@ -377,6 +404,12 @@ class Running:
 
         script = config.scripts[job["script"]]
         env = dict(os.environ)
+        # The secrets a backend gave this job: its HF_TOKEN, its W&B key. In
+        # the training process's environment only - never this agent's own,
+        # which outlives the job - and set first, so that nothing smith sets
+        # below can be replaced by one.
+        self.secrets = job_secrets(job)
+        env.update(self.secrets)
         env["PYTHONUNBUFFERED"] = "1"
         env["RAVEX_METRICS_ENDPOINT"] = config.backend
         if config.token:
@@ -451,7 +484,7 @@ class Running:
         self._log = open(self.log_path, "ab")
         # Not `tail`: that is the method that reads the last lines for a
         # failure's message.
-        self.output = LogTail(self.id, self.log_path)
+        self.output = LogTail(self.id, self.log_path, self.secrets)
         if config.gpus > 1:
             # torchrun wants a file, not `-c`. One process per GPU, on this
             # machine only; Ravex sees the ranks and checkpoints once for all.
@@ -513,7 +546,8 @@ class Running:
         except OSError:
             return ""
         kept = [line for line in text.splitlines() if line.strip()][-lines:]
-        return "\n".join(kept)[-1500:]
+        # It goes to the backend as the failure's message: no secret in it.
+        return redact("\n".join(kept), self.secrets)[-1500:]
 
     def close(self) -> None:
         self._log.close()
