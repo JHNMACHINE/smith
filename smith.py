@@ -217,6 +217,31 @@ class Bucket:
     endpoint: Optional[str] = None
     region: Optional[str] = None
     path_style: bool = False
+    #: The bucket's own keys, when a backend handed one with a job. Unset,
+    #: the run takes this agent's RAVEX_S3_* from the environment. Out of
+    #: the repr, so that printing a bucket never prints them.
+    access_key: Optional[str] = field(default=None, repr=False)
+    secret_key: Optional[str] = field(default=None, repr=False)
+
+    @classmethod
+    def from_job(cls, table: Dict[str, Any]) -> "Bucket":
+        """The bucket a backend handed with a job, keys included: that job's
+        store goes there instead of this agent's bucket."""
+        kind = str(table.get("type") or "s3")
+        if kind not in ("s3", "r2") or not table.get("bucket"):
+            raise RuntimeError("the job's storage is not a bucket this agent can use")
+        if not (table.get("access_key") and table.get("secret_key")):
+            raise RuntimeError("the job's storage came without its keys")
+        return cls(
+            type=kind,
+            bucket=str(table["bucket"]),
+            prefix=str(table.get("prefix") or "").strip("/"),
+            endpoint=table.get("endpoint"),
+            region=table.get("region"),
+            path_style=bool(table.get("path_style")),
+            access_key=str(table["access_key"]),
+            secret_key=str(table["secret_key"]),
+        )
 
     @classmethod
     def from_table(cls, table: Any, path: str) -> Optional["Bucket"]:
@@ -263,6 +288,9 @@ class Bucket:
             env["RAVEX_STORAGE_ENDPOINT"] = str(self.endpoint)
         if self.region:
             env["RAVEX_STORAGE_REGION"] = str(self.region)
+        if self.access_key and self.secret_key:
+            env["RAVEX_S3_ACCESS_KEY"] = self.access_key
+            env["RAVEX_S3_SECRET_KEY"] = self.secret_key
         return env
 
 
@@ -411,10 +439,18 @@ class Running:
         self.secrets = job_secrets(job)
         env.update(self.secrets)
         env["PYTHONUNBUFFERED"] = "1"
+        # The bucket this job's store goes to: the one the backend handed with
+        # it - the job's owner's own - or else this agent's.
+        bucket = Bucket.from_job(job["storage"]) if job.get("storage") else config.storage
+        #: Every value the job's output must not carry back: its secrets, and
+        #: its bucket's keys when they came with it.
+        self.hidden = dict(self.secrets)
+        if bucket is not None and bucket.access_key and bucket.secret_key:
+            self.hidden["STORAGE_ACCESS_KEY"] = bucket.access_key
+            self.hidden["STORAGE_SECRET_KEY"] = bucket.secret_key
         env["RAVEX_METRICS_ENDPOINT"] = config.backend
         if config.token:
             env["RAVEX_METRICS_TOKEN"] = config.token
-        bucket = config.storage
         source = ""
         if job["mode"] in ("resume", "update", "fork"):
             source = job.get("source_store_uri") or ""
@@ -484,7 +520,7 @@ class Running:
         self._log = open(self.log_path, "ab")
         # Not `tail`: that is the method that reads the last lines for a
         # failure's message.
-        self.output = LogTail(self.id, self.log_path, self.secrets)
+        self.output = LogTail(self.id, self.log_path, self.hidden)
         if config.gpus > 1:
             # torchrun wants a file, not `-c`. One process per GPU, on this
             # machine only; Ravex sees the ranks and checkpoints once for all.
@@ -547,7 +583,7 @@ class Running:
             return ""
         kept = [line for line in text.splitlines() if line.strip()][-lines:]
         # It goes to the backend as the failure's message: no secret in it.
-        return redact("\n".join(kept), self.secrets)[-1500:]
+        return redact("\n".join(kept), self.hidden)[-1500:]
 
     def close(self) -> None:
         self._log.close()

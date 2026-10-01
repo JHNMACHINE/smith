@@ -50,6 +50,12 @@ never its own, and never one named `RAVEX_*` or `SMITH_*`; and it replaces
 their values with `[secret NAME]` in the output lines and failure messages it
 sends back.
 
+A claimed job may also carry `storage`, a bucket with its keys
+(`type`, `bucket`, `prefix`, `endpoint`, `region`, `path_style`, `access_key`,
+`secret_key`): that job's store goes there instead of the agent's own bucket,
+the keys reach only its process, and they are kept out of what is sent back
+like secrets.
+
 The runs are [Ravex](https://github.com/JHNMACHINE/ravex) scripts: smith hands
 them their store, name and the backend's address through `RAVEX_*` variables,
 and ships what a finished run could not send with `ravex ship`.
