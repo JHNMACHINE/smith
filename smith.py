@@ -32,7 +32,8 @@ this node's own store inside the run's (two nodes writing one store would
 overwrite each other); ``token``, the run's ``RAVEX_JOB_TOKEN``, which keeps
 anyone else out of its rendezvous; and on the node that hosts it, ``serve``:
 the port of a ``ravex rendezvous`` this agent starts beside the script and
-stops after it. Where the rendezvous is and what the run's settings are come
+keeps serving after it, for the nodes still training, until it takes its next
+job. Where the rendezvous is and what the run's settings are come
 in the job's ``config``, like any other run's. Nothing in ``outer`` is a
 command: the agent runs Ravex's own server, on a port.
 
@@ -626,10 +627,17 @@ class Running:
 
     def close(self) -> None:
         self._log.close()
+
+    def stop_rendezvous(self) -> None:
+        """Stop serving the run's rendezvous, if this job started one.
+
+        Not when the job ends: the other nodes of the run read their peers'
+        addresses from it on every exchange, and the last of them may finish
+        minutes after this one. Stopping it with node 0's job took the run's
+        slowest node down with it (GPU-186). It goes when this agent takes its
+        next job, or with the node.
+        """
         if self.rendezvous is not None:
-            # The run is over for this node, and the others' with it: the
-            # rendezvous only serves joins, and a node that outlived node 0's
-            # job has nothing left to join.
             self.rendezvous.terminate()
             try:
                 self.rendezvous.wait(10)
@@ -647,6 +655,9 @@ class Agent:
         self.config = config
         self.backend = Backend(config.backend, config.token)
         self.current: Optional[Running] = None
+        #: A finished job whose run's rendezvous this agent still serves, for
+        #: the nodes of the run that have not finished yet.
+        self.serving: Optional[Running] = None
         #: Stores of finished runs whose leftovers still have to reach the
         #: backend, and when to try next.
         self.to_ship: Dict[str, float] = {}
@@ -691,6 +702,9 @@ class Agent:
         )
         if not job:
             return
+        if self.serving is not None:
+            self.serving.stop_rendezvous()
+            self.serving = None
         try:
             self.current = Running(job, self.config)
         except Exception as exc:
@@ -707,6 +721,9 @@ class Agent:
         code = running.process.poll()
         if code is not None:
             running.close()
+            if running.rendezvous is not None:
+                self.serving = running
+                log("job %d ended; still serving its run's rendezvous for the other nodes" % running.id)
             running.output.done = True
             self.send_logs()
             self.current = None

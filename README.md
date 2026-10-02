@@ -60,7 +60,8 @@ A claimed job that is one node's part of a run trained on several (Ravex's
 outer loop) carries `outer`: `member`, the name of this node's store inside the
 run's; `token`, the run's `RAVEX_JOB_TOKEN`, set in the job's environment and
 kept out of what is sent back; and, on the node that hosts it, `serve`, a port
-on which smith runs `ravex rendezvous` beside the script and stops it after.
+on which smith runs `ravex rendezvous` beside the script and keeps it up after,
+for the nodes still training, until it takes its next job.
 The rendezvous address and the run's other settings come in the job's
 `config`, as for any run.
 
