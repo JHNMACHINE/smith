@@ -56,6 +56,14 @@ A claimed job may also carry `storage`, a bucket with its keys
 the keys reach only its process, and they are kept out of what is sent back
 like secrets.
 
+A claimed job that is one node's part of a run trained on several (Ravex's
+outer loop) carries `outer`: `member`, the name of this node's store inside the
+run's; `token`, the run's `RAVEX_JOB_TOKEN`, set in the job's environment and
+kept out of what is sent back; and, on the node that hosts it, `serve`, a port
+on which smith runs `ravex rendezvous` beside the script and stops it after.
+The rendezvous address and the run's other settings come in the job's
+`config`, as for any run.
+
 The runs are [Ravex](https://github.com/JHNMACHINE/ravex) scripts: smith hands
 them their store, name and the backend's address through `RAVEX_*` variables,
 and ships what a finished run could not send with `ravex ship`.

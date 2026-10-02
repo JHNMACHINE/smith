@@ -26,6 +26,16 @@ would be a remote shell on every training machine.
   it trains, and ``RAVEX_METRICS_TOKEN`` with the agent's token when
   the backend asks for one.
 
+**One run on several nodes.** A job that is one node's part of a run trained
+by several - Ravex's outer loop - says so in ``outer``: ``member``, the name of
+this node's own store inside the run's (two nodes writing one store would
+overwrite each other); ``token``, the run's ``RAVEX_JOB_TOKEN``, which keeps
+anyone else out of its rendezvous; and on the node that hosts it, ``serve``:
+the port of a ``ravex rendezvous`` this agent starts beside the script and
+stops after it. Where the rendezvous is and what the run's settings are come
+in the job's ``config``, like any other run's. Nothing in ``outer`` is a
+command: the agent runs Ravex's own server, on a port.
+
 **Where a run's store lives.** On a disk of this machine under ``runs``, or -
 with a ``[storage]`` table - in a bucket, under ``<prefix>/<run id>``, with
 the local directory only as Moonclip's staging copy. A rented node
@@ -439,12 +449,24 @@ class Running:
         self.secrets = job_secrets(job)
         env.update(self.secrets)
         env["PYTHONUNBUFFERED"] = "1"
+        outer = job.get("outer") or {}
+        #: This node's store inside the run's, on a run trained by several.
+        self.member = str(outer.get("member") or "")
+        if self.member and not self.member.replace("-", "").replace("_", "").isalnum():
+            raise RuntimeError("member %r is not a name a store can have" % self.member)
+        token = str(outer.get("token") or "")
+        if token:
+            env["RAVEX_JOB_TOKEN"] = token
+        #: The rendezvous this agent serves for the run, if it hosts it.
+        self.rendezvous: Optional[subprocess.Popen] = None
         # The bucket this job's store goes to: the one the backend handed with
         # it - the job's owner's own - or else this agent's.
         bucket = Bucket.from_job(job["storage"]) if job.get("storage") else config.storage
         #: Every value the job's output must not carry back: its secrets, and
         #: its bucket's keys when they came with it.
         self.hidden = dict(self.secrets)
+        if token:
+            self.hidden["RAVEX_JOB_TOKEN"] = token
         if bucket is not None and bucket.access_key and bucket.secret_key:
             self.hidden["STORAGE_ACCESS_KEY"] = bucket.access_key
             self.hidden["STORAGE_SECRET_KEY"] = bucket.secret_key
@@ -491,9 +513,10 @@ class Running:
             # point at the run before the run existed. A backend
             # from before that has none, and the agent makes one up.
             self.run_id = str(job.get("run_ref") or new_run_id())
-            store = os.path.join(config.runs, self.run_id)
+            where = "%s/%s" % (self.run_id, self.member) if self.member else self.run_id
+            store = os.path.join(config.runs, *where.split("/"))
             if bucket is not None:
-                env.update(bucket.environment(bucket.prefix_of(self.run_id)))
+                env.update(bucket.environment(bucket.prefix_of(where)))
             env["RAVEX_RUN_ID"] = self.run_id
             env["RAVEX_NAME"] = str(job["name"])
             if job["mode"] == "fork":
@@ -521,6 +544,22 @@ class Running:
         # Not `tail`: that is the method that reads the last lines for a
         # failure's message.
         self.output = LogTail(self.id, self.log_path, self.hidden)
+        serve = outer.get("serve")
+        if serve:
+            port = int(serve)
+            if not 1024 <= port <= 65535:
+                raise RuntimeError("port %d is not one a rendezvous can listen on" % port)
+            # Before the script, which dials it. Its output beside the job's;
+            # its token from the environment, never its command line.
+            self._rendezvous_log = open(os.path.join(logs, "job-%d.rendezvous.log" % self.id), "ab")
+            self.rendezvous = subprocess.Popen(
+                [config.python, "-m", "ravex._cli", "rendezvous", "--host", "0.0.0.0", "--port", str(port)],
+                env=env,
+                stdout=self._rendezvous_log,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+            )
+            log("job %d: serving the run's rendezvous on port %d, pid %d" % (self.id, port, self.rendezvous.pid))
         if config.gpus > 1:
             # torchrun wants a file, not `-c`. One process per GPU, on this
             # machine only; Ravex sees the ranks and checkpoints once for all.
@@ -587,6 +626,17 @@ class Running:
 
     def close(self) -> None:
         self._log.close()
+        if self.rendezvous is not None:
+            # The run is over for this node, and the others' with it: the
+            # rendezvous only serves joins, and a node that outlived node 0's
+            # job has nothing left to join.
+            self.rendezvous.terminate()
+            try:
+                self.rendezvous.wait(10)
+            except subprocess.TimeoutExpired:
+                self.rendezvous.kill()
+            self._rendezvous_log.close()
+            self.rendezvous = None
 
 
 # ─── the loop ───────────────────────────────────────────────────────
