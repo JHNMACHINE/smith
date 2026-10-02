@@ -26,6 +26,24 @@ would be a remote shell on every training machine.
   it trains, and ``RAVEX_METRICS_TOKEN`` with the agent's token when
   the backend asks for one.
 
+**Code from a repository.** An agent started with ``code = true`` (or
+``SMITH_CODE=1``) also takes jobs that carry ``code``: a repository over
+HTTPS, a commit as a full SHA, and the name of a manifest file in it. The job
+names a script from the manifest's ``[scripts]`` table - the same shape as
+this file's - instead of one of the agent's own. Before it starts, the job's
+process fetches that commit alone into ``runs/_code/<repository>/<commit>``,
+makes a virtual environment beside it when the repository has a
+``requirements.txt`` or a ``pyproject.toml`` (on top of this Python's own
+packages, so torch and Ravex are there already; with ``uv`` when it is
+installed) and then runs the script with the job's parameters as flags. A
+commit already fetched is used again. Every step is in the job's output. It
+is still never a command: a repository, a commit and a name, each checked.
+It is opt-in because it runs whatever the repository holds: on a machine of
+the person whose repository it is, or one rented for them, that is the point;
+on a machine shared with others, leave it off. A private repository's token
+comes with the job and reaches git through its environment, never its
+command line, and never the training process.
+
 **One run on several nodes.** A job that is one node's part of a run trained
 by several - Ravex's outer loop - says so in ``outer``: ``member``, the name of
 this node's own store inside the run's (two nodes writing one store would
@@ -81,6 +99,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -134,6 +153,113 @@ runpy.run_path(_path, run_name="__main__")
 """
 
 
+#: What a job's code may be: a repository over HTTPS, a commit as a full SHA,
+#: a manifest and a script named plainly. Checked before anything runs, so a
+#: value cannot become an option of git or a path out of the checkout.
+_REPO = re.compile(r"^https://[A-Za-z0-9.-]+(?::\d+)?/[A-Za-z0-9_.~/-]+$")
+_SHA = re.compile(r"^[0-9a-f]{40}$")
+_RELATIVE = re.compile(r"^(?!/)(?!.*\.\.)[A-Za-z0-9_./-]{1,200}$")
+_SCRIPT = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
+#: A job with ``code`` runs this first, as its own process: fetch the commit,
+#: make its environment, find the script in the manifest, then become the
+#: training. In the job's process and not in this agent, so a clone and an
+#: install of several minutes neither stop the heartbeats nor escape the
+#: job's output, and a stop reaches them like it reaches the training.
+_PREPARE = r"""
+import base64, json, os, shutil, signal, subprocess, sys, tomllib
+
+spec = json.loads(os.environ.pop("SMITH_PREPARE"))
+token = os.environ.pop("SMITH_GIT_TOKEN", "")
+
+
+def say(message):
+    print("[smith] " + message, flush=True)
+
+
+def fail(message):
+    say(message)
+    sys.exit(2)
+
+
+def run(command, what, **kwargs):
+    if subprocess.run(command, stdin=subprocess.DEVNULL, **kwargs).returncode != 0:
+        fail("could not " + what)
+
+
+tree = spec["tree"]
+ready = os.path.join(tree, ".smith-ready")
+short = spec["commit"][:12]
+if os.path.isfile(ready):
+    with open(ready, encoding="utf-8") as handle:
+        python = json.load(handle)["python"]
+    say("%s at %s, fetched before" % (spec["repo"], short))
+else:
+    # From nothing each time: a fetch cut short leaves no marker.
+    shutil.rmtree(tree, ignore_errors=True)
+    os.makedirs(tree)
+    say("fetching %s at %s" % (spec["repo"], short))
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    if token:
+        # In git's environment, where other users of the machine cannot read
+        # it, rather than in the address or on the command line.
+        basic = base64.b64encode(("x-access-token:" + token).encode()).decode()
+        env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.extraHeader",
+                   GIT_CONFIG_VALUE_0="Authorization: Basic " + basic)
+    run(["git", "init", "-q", tree], "make a repository in " + tree, env=env)
+    run(["git", "-C", tree, "fetch", "-q", "--depth", "1", spec["repo"], spec["commit"]],
+        "fetch commit %s; is the repository right, and is a private one given its token?" % short, env=env)
+    run(["git", "-C", tree, "checkout", "-q", "--detach", "FETCH_HEAD"], "check out " + short, env=env)
+    python = sys.executable
+    wants = "requirements.txt" if os.path.isfile(os.path.join(tree, "requirements.txt")) else (
+        "pyproject.toml" if os.path.isfile(os.path.join(tree, "pyproject.toml")) else None)
+    if wants:
+        venv = os.path.join(tree, ".smith-venv")
+        run([sys.executable, "-m", "venv", "--system-site-packages", venv], "make a virtual environment")
+        python = os.path.join(venv, "Scripts", "python.exe") if os.name == "nt" else os.path.join(venv, "bin", "python")
+        what = ["-r", "requirements.txt"] if wants == "requirements.txt" else ["."]
+        say("installing what %s asks for" % wants)
+        uv = shutil.which("uv")
+        if uv:
+            run([uv, "pip", "install", "--python", python] + what, "install the dependencies", cwd=tree)
+        else:
+            run([python, "-m", "pip", "install", "--disable-pip-version-check", "-q"] + what,
+                "install the dependencies", cwd=tree)
+    with open(ready, "w", encoding="utf-8") as handle:
+        json.dump({"python": python}, handle)
+
+manifest = os.path.join(tree, spec["manifest"])
+if not os.path.isfile(manifest):
+    fail("%s has no %s, which names the scripts that may be run" % (short, spec["manifest"]))
+with open(manifest, "rb") as handle:
+    scripts = tomllib.load(handle).get("scripts") or {}
+entry = scripts.get(spec["script"])
+if entry is None:
+    fail("%s declares no script %r; it has %s" % (spec["manifest"], spec["script"], ", ".join(sorted(scripts)) or "none"))
+path = entry.get("path") if isinstance(entry, dict) else entry
+root = os.path.realpath(tree)
+script = os.path.realpath(os.path.join(root, str(path or "")))
+if not path or os.path.commonpath([script, root]) != root or not os.path.isfile(script):
+    fail("scripts.%s in %s is not a file of the repository" % (spec["script"], spec["manifest"]))
+
+if spec["gpus"] > 1:
+    command = [python, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node", str(spec["gpus"]),
+               spec["launcher_file"], script]
+else:
+    command = [python, "-c", spec["launcher"], script]
+command += spec["flags"]
+say("running %s" % spec["script"])
+os.chdir(root)
+if os.name == "nt":
+    # No exec on Windows: wait for the training, and leave a stop to it.
+    for name in ("SIGBREAK", "SIGINT"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), signal.SIG_IGN)
+    sys.exit(subprocess.run(command).returncode)
+os.execv(command[0], command)
+"""
+
+
 def log(message: str) -> None:
     print(time.strftime("%H:%M:%S"), message, flush=True)
 
@@ -166,6 +292,9 @@ class Config:
     #: GPUs on this machine. More than one, and a job runs one process per GPU
     #: under torchrun: a node with four GPUs uses all four.
     gpus: int = 1
+    #: Whether it takes jobs that bring a repository's commit to run (see
+    #: "Code from a repository" above). Off unless asked for.
+    code: bool = False
 
     @classmethod
     def load(cls, path: str) -> "Config":
@@ -192,12 +321,13 @@ class Config:
             if given is not None and not isinstance(given, dict):
                 raise SystemExit("scripts.%s.params is not a table" % key)
             params[key] = dict(given or {})
-        if not scripts:
-            raise SystemExit("%s names no scripts; there would be nothing to run" % path)
         # The environment wins over the file for what differs between machines
         # running the same image: a rented pod is configured with variables,
         # and its image carries one file for all of them.
         env = os.environ.get
+        code = str(env("SMITH_CODE") or raw.get("code", False)).lower() in ("true", "1", "yes")
+        if not scripts and not code:
+            raise SystemExit("%s names no scripts; there would be nothing to run" % path)
         table = dict(raw.get("storage") or {})
         for key in ("type", "bucket", "prefix", "endpoint", "region", "path_style"):
             if env("SMITH_STORAGE_" + key.upper()):
@@ -215,6 +345,7 @@ class Config:
             params=params,
             token=os.environ.get("SMITH_TOKEN") or raw.get("token") or None,
             storage=storage,
+            code=code,
         )
 
 
@@ -441,7 +572,10 @@ class Running:
         self.stop_requested_at: Optional[float] = None
         self.last_report = 0.0
 
-        script = config.scripts[job["script"]]
+        #: The repository's commit this job runs, checked; None for one of
+        #: this agent's own scripts.
+        self.code = self._checked_code(job, config) if job.get("code") else None
+        script = config.scripts[job["script"]] if self.code is None else ""
         env = dict(os.environ)
         # The secrets a backend gave this job: its HF_TOKEN, its W&B key. In
         # the training process's environment only - never this agent's own,
@@ -471,6 +605,8 @@ class Running:
         if bucket is not None and bucket.access_key and bucket.secret_key:
             self.hidden["STORAGE_ACCESS_KEY"] = bucket.access_key
             self.hidden["STORAGE_SECRET_KEY"] = bucket.secret_key
+        if self.code is not None and self.code.get("token"):
+            self.hidden["GIT_TOKEN"] = str(self.code["token"])
         env["RAVEX_METRICS_ENDPOINT"] = config.backend
         if config.token:
             env["RAVEX_METRICS_TOKEN"] = config.token
@@ -561,21 +697,46 @@ class Running:
                 stdin=subprocess.DEVNULL,
             )
             log("job %d: serving the run's rendezvous on port %d, pid %d" % (self.id, port, self.rendezvous.pid))
+        launcher = os.path.join(logs, "_launcher.py")
         if config.gpus > 1:
             # torchrun wants a file, not `-c`. One process per GPU, on this
             # machine only; Ravex sees the ranks and checkpoints once for all.
             # A stop reaches every one of them: they share the process group
             # the signal is sent to.
-            launcher = os.path.join(logs, "_launcher.py")
             with open(launcher, "w", encoding="utf-8") as handle:
                 handle.write(_LAUNCHER)
-            command = [
-                config.python, "-m", "torch.distributed.run", "--standalone",
-                "--nproc_per_node", str(config.gpus), launcher, script,
-            ]
+        if self.code is not None:
+            # The preparer fetches the commit and becomes the training; what
+            # it needs in its environment, the token apart from the rest so
+            # it can drop it before the training starts.
+            os.makedirs(self.code["root"], exist_ok=True)
+            env["SMITH_PREPARE"] = json.dumps(
+                {
+                    "repo": self.code["repo"],
+                    "commit": self.code["commit"],
+                    "manifest": self.code["manifest"],
+                    "script": job["script"],
+                    "tree": os.path.join(self.code["root"], self.code["commit"]),
+                    "gpus": config.gpus,
+                    "launcher": _LAUNCHER,
+                    "launcher_file": launcher,
+                    "flags": flags(job.get("params") or {}),
+                }
+            )
+            if self.code.get("token"):
+                env["SMITH_GIT_TOKEN"] = str(self.code["token"])
+            command = [config.python, "-c", _PREPARE]
+            workdir = self.code["root"]
         else:
-            command = [config.python, "-c", _LAUNCHER, script]
-        command += flags(job.get("params") or {})
+            if config.gpus > 1:
+                command = [
+                    config.python, "-m", "torch.distributed.run", "--standalone",
+                    "--nproc_per_node", str(config.gpus), launcher, script,
+                ]
+            else:
+                command = [config.python, "-c", _LAUNCHER, script]
+            command += flags(job.get("params") or {})
+            workdir = os.path.dirname(script)
         extra: Dict[str, Any] = {}
         if os.name == "nt":
             # Its own group, so CTRL_BREAK reaches it and not this agent.
@@ -585,7 +746,7 @@ class Running:
         self.process = subprocess.Popen(
             command,
             env=env,
-            cwd=os.path.dirname(script),
+            cwd=workdir,
             stdout=self._log,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
@@ -595,6 +756,28 @@ class Running:
             "job %d (%s, %s) started as run %s, pid %d; output in %s"
             % (self.id, job["name"], job["mode"], self.run_id, self.process.pid, self.log_path)
         )
+
+    @staticmethod
+    def _checked_code(job: Dict[str, Any], config: Config) -> Dict[str, Any]:
+        """The job's repository, commit and manifest, each held to what it may
+        be, and where its checkouts go; refused on an agent that runs no code."""
+        if not config.code:
+            raise RuntimeError("this agent runs only its own scripts (code = true to run a repository's)")
+        code = job["code"]
+        repo, commit = str(code.get("repo") or ""), str(code.get("commit") or "")
+        manifest = str(code.get("manifest") or "")
+        if not _REPO.match(repo) or ".." in repo:
+            raise RuntimeError("%r is not a repository this agent fetches: an https address" % repo)
+        if not _SHA.match(commit):
+            raise RuntimeError("%r is not a commit: a full SHA, 40 hexadecimal characters" % commit)
+        if not _RELATIVE.match(manifest):
+            raise RuntimeError("%r is not a file of a repository" % manifest)
+        if not _SCRIPT.match(str(job.get("script") or "")):
+            raise RuntimeError("%r is not a script's name" % job.get("script"))
+        # One directory per repository, its commits side by side.
+        place = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo.split("://", 1)[1]).strip("-")
+        root = os.path.join(config.runs, "_code", place)
+        return {**code, "repo": repo, "commit": commit, "manifest": manifest, "root": root}
 
     def stop(self) -> None:
         now = time.monotonic()
@@ -698,7 +881,12 @@ class Agent:
         job = self.backend.call(
             "POST",
             "/api/jobs/claim",
-            {"agent": self.config.name, "scripts": sorted(self.config.scripts), "hardware": self.config.hardware},
+            {
+                "agent": self.config.name,
+                "scripts": sorted(self.config.scripts),
+                "hardware": self.config.hardware,
+                "code": self.config.code,
+            },
         )
         if not job:
             return
@@ -846,11 +1034,12 @@ class Agent:
     def run(self) -> None:
         bucket = self.config.storage
         log(
-            "agent %s: %d script(s) (%s), %s, backend %s%s, runs in %s"
+            "agent %s: %d script(s) (%s)%s, %s, backend %s%s, runs in %s"
             % (
                 self.config.name,
                 len(self.config.scripts),
                 ", ".join(sorted(self.config.scripts)),
+                " and repositories' code" if self.config.code else "",
                 self.config.hardware,
                 self.config.backend,
                 " with a token" if self.config.token else "",

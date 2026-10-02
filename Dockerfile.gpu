@@ -132,12 +132,16 @@ RUN pip install --index-url ${TORCH_INDEX} --extra-index-url https://pypi.org/si
 # TileLang's own `nvcc` extra asks for CUDA 13, whose output the 570 drivers
 # this image is for may not load. Found by compiling the kernels in this image
 # on a machine without a GPU - lowering and nvcc need none.
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates g++     && curl -fsSL -o /tmp/keyring.deb       https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb     && dpkg -i /tmp/keyring.deb && rm /tmp/keyring.deb     && apt-get update && apt-get install -y --no-install-recommends       cuda-nvcc-12-8 cuda-cudart-dev-12-8 cuda-cccl-12-8     && rm -rf /var/lib/apt/lists/*
+# git is for a job that brings a repository's commit (code = true): the
+# node fetches that commit alone.
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates g++ git     && curl -fsSL -o /tmp/keyring.deb       https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb     && dpkg -i /tmp/keyring.deb && rm /tmp/keyring.deb     && apt-get update && apt-get install -y --no-install-recommends       cuda-nvcc-12-8 cuda-cudart-dev-12-8 cuda-cccl-12-8     && rm -rf /var/lib/apt/lists/*
 ENV CUDA_HOME=/usr/local/cuda-12.8     PATH="/usr/local/cuda-12.8/bin:${PATH}"
 
 # psutil for CPU and RAM, nvidia-ml-py (imported as pynvml) for the GPUs:
 # Ravex samples each only if it is importable, and says nothing otherwise.
-RUN pip install psutil nvidia-ml-py
+# uv installs what a repository's requirements ask for, in its venv, much
+# faster than pip; without it smith falls back to pip.
+RUN pip install psutil nvidia-ml-py uv
 
 COPY --from=wheels /wheels /wheels
 RUN pip install /wheels/*.whl && rm -rf /wheels

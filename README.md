@@ -65,6 +65,17 @@ for the nodes still training, until it takes its next job.
 The rendezvous address and the run's other settings come in the job's
 `config`, as for any run.
 
+With `code = true` in its configuration (or `SMITH_CODE=1`), smith claims
+with `"code": true` and may get a job that carries `code`: `repo` (an https
+address), `commit` (a full SHA), `manifest` (a file in the repository with a
+`[scripts]` table, like smith's own) and, for a private repository, `token`.
+The job's `script` is then one of the manifest's. smith fetches that commit
+alone, installs its `requirements.txt` or `pyproject.toml` in a virtual
+environment on top of its own packages (with `uv` when there is one), and runs
+the script with the job's parameters. It runs whatever the repository holds,
+so leave it off on a machine shared with people the repository is not theirs.
+The token reaches git through its environment only, and never the run.
+
 The runs are [Ravex](https://github.com/JHNMACHINE/ravex) scripts: smith hands
 them their store, name and the backend's address through `RAVEX_*` variables,
 and ships what a finished run could not send with `ravex ship`.
