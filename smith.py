@@ -136,6 +136,12 @@ TIMEOUT = 10.0
 #: one process can send another's group is CTRL_BREAK, whose default is to
 #: end the process on the spot - no final checkpoint, and a status left saying
 #: "running". Turned into an exception, it unwinds through Ravex like Ctrl-C.
+#:
+#: Once it has unwound - Ravex's final checkpoint written on the way out - it
+#: ends here with one line, not the stack trace Python would print for it: a
+#: stop asked for is not a crash, and a page of traceback in the job's output
+#: read like one. The job's state does not come from this exit; the agent
+#: knows a stop was asked for.
 _LAUNCHER = """
 import os, runpy, signal, sys
 
@@ -149,7 +155,11 @@ for _name in ("SIGBREAK", "SIGTERM"):
 _path = sys.argv[1]
 sys.argv = sys.argv[1:]
 sys.path.insert(0, os.path.dirname(os.path.abspath(_path)))
-runpy.run_path(_path, run_name="__main__")
+try:
+    runpy.run_path(_path, run_name="__main__")
+except KeyboardInterrupt:
+    print("[smith] stopped on request", file=sys.stderr, flush=True)
+    sys.exit(130)
 """
 
 
