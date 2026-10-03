@@ -1,2 +1,5 @@
 __pycache__/
 runs/
+
+# Notes for the agent working here: kept local, not published.
+CLAUDE.md
