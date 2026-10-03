@@ -163,6 +163,42 @@ except KeyboardInterrupt:
 """
 
 
+#: Whether the GPUs are there, asked of the interpreter that runs the
+#: training, the way the training will: torch sees CUDA, as many GPUs as the
+#: machine has, and a small sum on each comes back. A machine rented as a GPU
+#: whose container cannot reach it would otherwise train on the CPU - slowly,
+#: and paid for as a GPU - and say so only in a warning nobody reads (GPU-188).
+#: The last line it prints is what is wrong, or what it found.
+_GPU_CHECK = r"""
+import sys
+want = int(sys.argv[1])
+try:
+    import torch
+except Exception as exc:
+    print("torch cannot be imported: %s" % exc)
+    sys.exit(1)
+if not torch.cuda.is_available():
+    print("torch finds no usable CUDA device on this machine")
+    sys.exit(1)
+have = torch.cuda.device_count()
+if have < want:
+    print("torch sees %d GPU(s), and this machine is meant to have %d" % (have, want))
+    sys.exit(1)
+try:
+    for index in range(want):
+        x = torch.ones(1024, device="cuda:%d" % index)
+        (x * 2).sum().item()
+except Exception as exc:
+    print("GPU %d does not compute: %s" % (index, exc))
+    sys.exit(1)
+print("%d GPU(s): %s" % (want, ", ".join(torch.cuda.get_device_name(i) for i in range(want))))
+"""
+
+#: How long the check may take: loading torch and CUDA on a cold machine is
+#: tens of seconds, never minutes.
+GPU_CHECK_SECONDS = 180.0
+
+
 #: What a job's code may be: a repository over HTTPS, a commit as a full SHA,
 #: a manifest and a script named plainly. Checked before anything runs, so a
 #: value cannot become an option of git or a path out of the checkout.
@@ -305,6 +341,10 @@ class Config:
     #: Whether it takes jobs that bring a repository's commit to run (see
     #: "Code from a repository" above). Off unless asked for.
     code: bool = False
+    #: Whether it checks at start that its GPUs work (``_GPU_CHECK``), and
+    #: takes no job if they do not. On by default for hardware named
+    #: ``gpu...``; ``check_gpus`` / ``SMITH_CHECK_GPUS`` say otherwise.
+    check_gpus: bool = False
 
     @classmethod
     def load(cls, path: str) -> "Config":
@@ -356,6 +396,10 @@ class Config:
             token=os.environ.get("SMITH_TOKEN") or raw.get("token") or None,
             storage=storage,
             code=code,
+            check_gpus=str(
+                env("SMITH_CHECK_GPUS")
+                or raw.get("check_gpus", str(env("SMITH_HARDWARE") or raw.get("hardware", "local-cpu")).startswith("gpu"))
+            ).lower() in ("true", "1", "yes"),
         )
 
 
@@ -863,6 +907,36 @@ class Agent:
         self._ship_env = dict(os.environ)
         if config.token:
             self._ship_env["RAVEX_METRICS_TOKEN"] = config.token
+        #: What is wrong with this machine, when its GPUs failed the check:
+        #: said in every heartbeat, and no job is taken while it stands.
+        self.fault: Optional[str] = None
+
+    def check_gpus(self) -> None:
+        """Run the GPU check once, before the first job."""
+        try:
+            done = subprocess.run(
+                [self.config.python, "-c", _GPU_CHECK, str(self.config.gpus)],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=GPU_CHECK_SECONDS,
+            )
+            # Its own last line; failing that, Python's, for a check that
+            # died before it could say anything.
+            said = [line for line in (done.stdout or "").splitlines() if line.strip()] or [
+                line for line in (done.stderr or "").splitlines() if line.strip()
+            ]
+            last = said[-1] if said else "no answer"
+            if done.returncode != 0:
+                self.fault = "the GPU check failed: %s" % last
+            else:
+                log("GPUs checked: %s" % last)
+        except subprocess.TimeoutExpired:
+            self.fault = "the GPU check did not finish in %d seconds" % GPU_CHECK_SECONDS
+        except OSError as exc:
+            self.fault = "the GPU check could not start: %s" % exc
+        if self.fault:
+            log("%s; this machine takes no job" % self.fault)
 
     def beat(self) -> None:
         self.backend.call(
@@ -876,6 +950,9 @@ class Agent:
                 "hardware": self.config.hardware,
                 "host": socket.gethostname(),
                 "job_id": self.current.id if self.current else None,
+                # Only when there is one: a backend that knows nothing of it
+                # is not sent a field it would have to ignore.
+                **({"fault": self.fault} if self.fault else {}),
             },
         )
 
@@ -1058,6 +1135,8 @@ class Agent:
                 else "s3://%s/%s, staged in %s" % (bucket.bucket, bucket.prefix, self.config.runs),
             )
         )
+        if self.config.check_gpus:
+            self.check_gpus()
         self.reconcile()
         while True:
             # Before the heartbeat: it needs no answer from the backend to
@@ -1066,7 +1145,7 @@ class Agent:
             self.send_logs()
             try:
                 self.beat()
-                if self.current is None:
+                if self.current is None and self.fault is None:
                     self.take()
                 else:
                     self.watch()

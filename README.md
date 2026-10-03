@@ -38,7 +38,7 @@ JSON over HTTP, with `Authorization: Bearer <SMITH_TOKEN>` when a token is set:
 
 | call | what for |
 |---|---|
-| `POST /api/agents/heartbeat` | smith is alive, with its name, hardware and the scripts it can run |
+| `POST /api/agents/heartbeat` | smith is alive, with its name, hardware and the scripts it can run; `fault`, when its GPUs failed the check below |
 | `POST /api/jobs/claim` | the next queued job this node can run, or nothing |
 | `PATCH /api/jobs/{id}` | a job's state: running, finished, failed, and the run id |
 | `POST /api/jobs/{id}/logs` | the job's output, numbered line by line |
@@ -86,4 +86,13 @@ On a node, what differs between machines comes from the environment:
 `SMITH_BACKEND`, `SMITH_TOKEN`, `SMITH_NAME`,
 `SMITH_HARDWARE`, `SMITH_GPUS`, `SMITH_STORAGE_*`, and the
 bucket's `RAVEX_S3_ACCESS_KEY` / `RAVEX_S3_SECRET_KEY`.
+
+**The GPU check.** On hardware named `gpu...`, smith first asks the
+interpreter that runs the training whether its GPUs work: torch sees CUDA, as
+many GPUs as `SMITH_GPUS`, and a small sum on each. A machine whose container
+cannot reach its GPU would otherwise train on the CPU, slowly, while it is paid
+for as a GPU. If the check fails smith takes no job, and says what is wrong as
+`fault` in every heartbeat, for the backend to give the machine back.
+`check_gpus = false` (or `SMITH_CHECK_GPUS=0`) turns it off; `true` turns it
+on for hardware named otherwise.
 
