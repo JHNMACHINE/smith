@@ -82,6 +82,18 @@ the process is interrupted the way Ctrl-C would: Ravex sees a
 ``KeyboardInterrupt``, writes its final checkpoint and records the run as
 ``interrupted``. One that has not exited a minute later is killed.
 
+**What one machine compiled, the next one does not (GPU-181).** The wheels
+uv builds from source - flash-attn takes from minutes to hours - and the
+kernels Triton, Inductor and TileLang compile on first use go to directories
+under ``runs/_cache``, so the next job on this machine finds them. A job that
+brings its owner's own bucket also takes them from ``_cache`` there before it
+starts and sends back what it added: ``ravex cache``, run with the job's own
+interpreter, decides whether what is stored was built for a machine like this
+one, and loads nothing otherwise. Never with this agent's bucket: on a rented
+node that is the platform's, shared by everybody, and a cache that every node
+may write is a way to run code on the others' machines. A cache that fails
+is said in the job's output and costs nothing but the compilation.
+
 **What a run could not send.** A run that ends while the backend is down does
 not wait for it - Ravex keeps the unsent metrics on disk for the next
 execution on that store, and a finished run never gets one. This agent
@@ -130,6 +142,28 @@ LOG_BATCH = 500
 LOG_READ = 1 << 20
 
 TIMEOUT = 10.0
+
+#: The compiled directories a job keeps, by name in the cache: the variable
+#: that points the tool at it, and the library whose version is part of what
+#: the files were built for. ``uv`` is the wheels it built from source, which
+#: `uv cache prune --ci` leaves alone while dropping what it downloaded.
+CACHES = (
+    ("uv", "UV_CACHE_DIR", "uv"),
+    ("triton", "TRITON_CACHE_DIR", "triton"),
+    ("inductor", "TORCHINDUCTOR_CACHE_DIR", "triton"),
+    ("tilelang", "TILELANG_CACHE_DIR", "tilelang"),
+)
+
+#: After a job, the kernels it compiled go back to its cache: one process for
+#: all of them, in the job's own interpreter, so the key is the training's.
+_PUSH_KERNELS = r"""
+import json, subprocess, sys
+spec = json.loads(sys.argv[1])
+for name, directory, library in spec["caches"]:
+    subprocess.run([spec["python"], "-m", "ravex._cli", "cache", "push", "--name", name,
+                    "--dir", directory, "--store", spec["store"], "--with", library],
+                   stdin=subprocess.DEVNULL)
+"""
 
 #: Runs the script the way ``python script.py`` would, with one difference: a
 #: stop request arrives as ``KeyboardInterrupt``. On Windows the only signal
@@ -217,6 +251,11 @@ import base64, json, os, shutil, signal, subprocess, sys, tomllib
 
 spec = json.loads(os.environ.pop("SMITH_PREPARE"))
 token = os.environ.pop("SMITH_GIT_TOKEN", "")
+# The cache's keys stay out of the training's environment; only `ravex cache`
+# gets them.
+cache_env = {name: os.environ.pop(name) for name in ("RAVEX_CACHE_ACCESS_KEY", "RAVEX_CACHE_SECRET_KEY",
+                                                       "RAVEX_CACHE_ENDPOINT", "RAVEX_CACHE_REGION",
+                                                       "RAVEX_CACHE_PATH_STYLE") if name in os.environ}
 
 
 def say(message):
@@ -231,6 +270,21 @@ def fail(message):
 def run(command, what, **kwargs):
     if subprocess.run(command, stdin=subprocess.DEVNULL, **kwargs).returncode != 0:
         fail("could not " + what)
+
+
+# Pull or push some of the job's caches; a failure is said and passed.
+def cache(action, python, names):
+    if not spec["cache_store"]:
+        return
+    for name, directory, library in spec["caches"]:
+        if name not in names:
+            continue
+        done = subprocess.run([python, "-m", "ravex._cli", "cache", action, "--name", name, "--dir", directory,
+                               "--store", spec["cache_store"], "--with", library],
+                              stdin=subprocess.DEVNULL, env=dict(os.environ, **cache_env))
+        if done.returncode != 0:
+            say("the %s cache was not %s; what it would have held is compiled here" % (
+                name, "used" if action == "pull" else "sent"))
 
 
 tree = spec["tree"]
@@ -257,6 +311,9 @@ else:
         "fetch commit %s; is the repository right, and is a private one given its token?" % short, env=env)
     run(["git", "-C", tree, "checkout", "-q", "--detach", "FETCH_HEAD"], "check out " + short, env=env)
     python = sys.executable
+    # Before the install, with this interpreter: the wheels are built against
+    # what it has, which is what the new environment starts from.
+    cache("pull", python, ("uv",))
     wants = "requirements.txt" if os.path.isfile(os.path.join(tree, "requirements.txt")) else (
         "pyproject.toml" if os.path.isfile(os.path.join(tree, "pyproject.toml")) else None)
     if wants:
@@ -268,11 +325,20 @@ else:
         uv = shutil.which("uv")
         if uv:
             run([uv, "pip", "install", "--python", python] + what, "install the dependencies", cwd=tree)
+            if spec["cache_store"]:
+                # What it downloaded is out, what it built stays: the cache is
+                # then only the wheels nobody publishes for this machine.
+                subprocess.run([uv, "cache", "prune", "--ci", "-q"], stdin=subprocess.DEVNULL)
+                cache("push", sys.executable, ("uv",))
         else:
             run([python, "-m", "pip", "install", "--disable-pip-version-check", "-q"] + what,
                 "install the dependencies", cwd=tree)
     with open(ready, "w", encoding="utf-8") as handle:
         json.dump({"python": python}, handle)
+
+# The kernels with the interpreter that will compile them: a torch the
+# repository installed in its environment is a key of its own.
+cache("pull", python, ("triton", "inductor", "tilelang"))
 
 manifest = os.path.join(tree, spec["manifest"])
 if not os.path.isfile(manifest):
@@ -661,6 +727,26 @@ class Running:
             self.hidden["STORAGE_SECRET_KEY"] = bucket.secret_key
         if self.code is not None and self.code.get("token"):
             self.hidden["GIT_TOKEN"] = str(self.code["token"])
+        #: The compiled directories, on this machine for every job.
+        self.caches = [
+            (name, os.path.join(config.runs, "_cache", name), library) for name, _variable, library in CACHES
+        ]
+        for (_name, directory, _library), (_same, variable, _lib) in zip(self.caches, CACHES):
+            env[variable] = directory
+        #: Where they are shared, and the keys for it: the job's owner's own
+        #: bucket, for a job that runs a repository, or nowhere.
+        self.cache_store = ""
+        self.cache_env: Dict[str, str] = {}
+        own = Bucket.from_job(job["storage"]) if job.get("storage") else None
+        if self.code is not None and own is not None and own.access_key and own.secret_key:
+            self.cache_store = "s3://%s/%s" % (own.bucket, own.prefix_of("_cache"))
+            self.cache_env = {"RAVEX_CACHE_ACCESS_KEY": own.access_key, "RAVEX_CACHE_SECRET_KEY": own.secret_key}
+            if own.endpoint:
+                self.cache_env["RAVEX_CACHE_ENDPOINT"] = str(own.endpoint)
+            if own.region:
+                self.cache_env["RAVEX_CACHE_REGION"] = str(own.region)
+            self.cache_env["RAVEX_CACHE_PATH_STYLE"] = "true" if own.path_style else "false"
+            env.update(self.cache_env)
         env["RAVEX_METRICS_ENDPOINT"] = config.backend
         if config.token:
             env["RAVEX_METRICS_TOKEN"] = config.token
@@ -775,6 +861,8 @@ class Running:
                     "launcher": _LAUNCHER,
                     "launcher_file": launcher,
                     "flags": flags(job.get("params") or {}),
+                    "caches": self.caches,
+                    "cache_store": self.cache_store,
                 }
             )
             if self.code.get("token"):
@@ -865,6 +953,34 @@ class Running:
     def close(self) -> None:
         self._log.close()
 
+    def push_caches(self, config: Config) -> Optional[subprocess.Popen]:
+        """Send the job's cache the kernels it compiled, in the background.
+
+        With the interpreter the preparer recorded, the one the training ran
+        in; a job that never got that far compiled nothing worth sending.
+        """
+        if not self.cache_store or self.code is None:
+            return None
+        ready = os.path.join(self.code["root"], self.code["commit"], ".smith-ready")
+        try:
+            with open(ready, encoding="utf-8") as handle:
+                python = json.load(handle)["python"]
+        except (OSError, ValueError, KeyError):
+            return None
+        kernels = [entry for entry in self.caches if entry[0] != "uv"]
+        out = open(os.path.join(config.runs, "_logs", "job-%d.cache.log" % self.id), "ab")
+        try:
+            return subprocess.Popen(
+                [config.python, "-c", _PUSH_KERNELS,
+                 json.dumps({"python": python, "store": self.cache_store, "caches": kernels})],
+                env=dict(os.environ, **self.cache_env),
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            out.close()
+
     def stop_rendezvous(self) -> None:
         """Stop serving the run's rendezvous, if this job started one.
 
@@ -907,6 +1023,8 @@ class Agent:
         self._ship_env = dict(os.environ)
         if config.token:
             self._ship_env["RAVEX_METRICS_TOKEN"] = config.token
+        #: Kernels of finished jobs on their way to their caches.
+        self.pushing: List[subprocess.Popen] = []
         #: What is wrong with this machine, when its GPUs failed the check:
         #: said in every heartbeat, and no job is taken while it stands.
         self.fault: Optional[str] = None
@@ -1014,6 +1132,9 @@ class Agent:
             # arrives when the run's own last attempt did not, and on a store
             # with nothing left it sends the run document again and no points.
             self.to_ship[running.store] = time.monotonic()
+            pushing = running.push_caches(self.config)
+            if pushing is not None:
+                self.pushing.append(pushing)
             return
         if running.stop_requested_at is not None:
             running.stop()
@@ -1044,6 +1165,9 @@ class Agent:
         so this agent keeps needing nothing but the standard library - and a
         backend that takes its time does not hold up the queue.
         """
+        # Reaped here, where nothing waits on them: a push that is still
+        # going does not hold up a job, and one that failed costs only time.
+        self.pushing = [process for process in self.pushing if process.poll() is None]
         if self.shipping is not None:
             store, process, first = self.shipping
             code = process.poll()
