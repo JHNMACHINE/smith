@@ -97,8 +97,5 @@ for as a GPU. If the check fails smith takes no job, and says what is wrong as
 on for hardware named otherwise.
 
 
-## License
-
-[PolyForm Noncommercial 1.0.0](LICENSE): free for non-commercial use.
-For anything else, get in touch via [GPU Zero](https://gpuzero.dev).
+Apache-2.0 — [GPU Zero](https://gpuzero.dev)
 
