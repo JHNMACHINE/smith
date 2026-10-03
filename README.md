@@ -96,3 +96,6 @@ for as a GPU. If the check fails smith takes no job, and says what is wrong as
 `check_gpus = false` (or `SMITH_CHECK_GPUS=0`) turns it off; `true` turns it
 on for hardware named otherwise.
 
+
+Apache-2.0 — [GPU Zero](https://gpuzero.dev)
+
