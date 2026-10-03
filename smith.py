@@ -73,9 +73,12 @@ them comes from the environment and wins over the file: ``SMITH_BACKEND``,
 ``SMITH_NAME``, ``SMITH_HARDWARE``, ``SMITH_GPUS``, and ``SMITH_STORAGE_TYPE``,
 ``_BUCKET``, ``_PREFIX``, ``_ENDPOINT``, ``_REGION``, ``_PATH_STYLE`` for the bucket.
 
-Its output goes to ``runs/_logs/job-<id>.log``, and from there to the backend
-a few seconds at a time, numbered line by line, so whoever watches the backend sees it while
-it runs - a traceback from a job that died at import included.
+Its output goes to ``runs/_logs/job-<id>.log`` - under torchrun, each rank's to
+``job-<id>.rank<n>.log`` beside it - and from there to the backend every half
+second, numbered line by line, so whoever watches the backend sees it while it
+runs: a traceback from a job that died at import included, and a progress bar
+redrawn with ``\r`` as the one line it is on a terminal. A secret of the job
+printed by the script is replaced by its name before it leaves the machine.
 
 **Stopping.** A job cancelled on the backend is noticed at the next report, and
 the process is interrupted the way Ctrl-C would: Ravex sees a
@@ -141,6 +144,11 @@ SHIP_RETRY_SECONDS = 30.0
 LOG_BATCH = 500
 LOG_READ = 1 << 20
 
+#: Seconds between two reads of the jobs' output. Shorter than a poll: a
+#: ``print`` on the node should be on the page within a second or two, and
+#: a read with nothing new costs no call (GPU-178).
+LOG_SECONDS = 0.5
+
 TIMEOUT = 10.0
 
 #: The compiled directories a job keeps, by name in the cache: the variable
@@ -176,6 +184,12 @@ for name, directory, library in spec["caches"]:
 #: stop asked for is not a crash, and a page of traceback in the job's output
 #: read like one. The job's state does not come from this exit; the agent
 #: knows a stop was asked for.
+#:
+#: Under torchrun, each rank writes to a file of its own (``SMITH_RANK_LOG``,
+#: with the local rank in it) instead of the job's: four processes printing
+#: into one file cut each other's lines in half, and which rank said what was
+#: lost. At the descriptors, so what CUDA, NCCL or a C extension prints is in
+#: it too, not only what goes through ``print`` (GPU-178).
 _LAUNCHER = """
 import os, runpy, signal, sys
 
@@ -185,6 +199,16 @@ def _stop(*_):
 for _name in ("SIGBREAK", "SIGTERM"):
     if hasattr(signal, _name):
         signal.signal(getattr(signal, _name), _stop)
+
+_ranked = os.environ.pop("SMITH_RANK_LOG", "")
+if _ranked and os.environ.get("LOCAL_RANK", "").isdigit():
+    _fd = os.open(_ranked % int(os.environ["LOCAL_RANK"]),
+                  os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.dup2(_fd, 1)
+    os.dup2(_fd, 2)
+    os.close(_fd)
 
 _path = sys.argv[1]
 sys.argv = sys.argv[1:]
@@ -634,23 +658,89 @@ def job_secrets(job: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
-class LogTail:
-    """A job's output file, followed and sent to the backend.
+class Screen:
+    """The line a terminal would be showing, as text is written to it.
 
-    Lines are numbered from the start of the file, and the offset only moves
-    once the backend has taken a whole read: a batch lost to a timeout is sent
-    again with the same numbers, which the backend keeps once. A line still
-    being written - no newline yet - waits for the next read, except at the
-    end of the job, when whatever is there is the last line.
+    ``\\r`` takes the cursor back to the start of the line and what follows
+    overwrites what was there, the way a progress bar redraws itself; ``\\n``
+    ends the line. Without this a tqdm bar was a thousand lines, one per
+    redraw, and the one that mattered - the last - was buried (GPU-178).
+    Escape sequences other than colours are not interpreted: a line redrawn
+    with cursor movements comes out as the text it wrote.
     """
 
-    def __init__(self, job_id: int, path: str, secrets: Optional[Dict[str, str]] = None) -> None:
+    def __init__(self, text: str = "", cursor: int = 0) -> None:
+        self.text = text
+        self.cursor = cursor
+
+    def copy(self) -> "Screen":
+        return Screen(self.text, self.cursor)
+
+    def write(self, data: str) -> List[str]:
+        """Write ``data``; the lines it ended, in order."""
+        ended: List[str] = []
+        for piece in re.split(r"(\r|\n)", data):
+            if piece == "\n":
+                ended.append(self.text)
+                self.text, self.cursor = "", 0
+            elif piece == "\r":
+                self.cursor = 0
+            elif piece:
+                self.text = self.text[: self.cursor] + piece + self.text[self.cursor + len(piece) :]
+                self.cursor += len(piece)
+                if len(self.text) > LINE_KEPT:
+                    # A "line" of megabytes - a bar with no \r, a dump - is
+                    # cut here rather than held whole in memory; the backend
+                    # keeps less than this of it anyway.
+                    self.text = self.text[:LINE_KEPT]
+                    self.cursor = min(self.cursor, LINE_KEPT)
+        return ended
+
+
+#: Most characters of one line this agent holds. The backend keeps 4000.
+LINE_KEPT = 8000
+
+
+def _whole(data: bytes) -> int:
+    """Where ``data`` ends if a UTF-8 character cut by the read is left out."""
+    lead = len(data) - 1
+    while lead > len(data) - 4 and lead > 0 and data[lead] & 0xC0 == 0x80:
+        lead -= 1
+    if lead < 0 or data[lead] < 0xC0:
+        return len(data)
+    size = 2 if data[lead] < 0xE0 else 3 if data[lead] < 0xF0 else 4
+    return len(data) if len(data) - lead >= size else lead
+
+
+class LogTail:
+    """One stream of a job's output - its process, or one rank's - followed
+    and sent to the backend.
+
+    Lines are numbered from the start of the stream, and nothing moves until
+    the backend has taken a whole read: a batch lost to a timeout is sent
+    again with the same numbers, which the backend keeps once. The line still
+    being written - no newline yet, typically a progress bar redrawing itself
+    with ``\\r`` - goes as ``partial``, each time it changes, so the page
+    shows the bar moving instead of nothing until it ends; it replaces the
+    previous one and is never numbered. At the end of the job it is the last
+    line.
+
+    ``rank`` is -1 for the job's own process, and the rank's number for the
+    stream of one process of several under torchrun (see ``rank_log``).
+    """
+
+    def __init__(self, job_id: int, path: str, secrets: Optional[Dict[str, str]] = None, rank: int = -1) -> None:
         self.job_id = job_id
         self.path = path
+        self.rank = rank
         #: Values that must not leave this machine in a log line.
         self.secrets = secrets or {}
         self.offset = 0
         self.line = 0
+        #: The line being written, as of ``offset``.
+        self.screen = Screen()
+        #: The line in progress as the backend last took it; None for none.
+        self.partial: Optional[str] = None
         #: The process has exited: nothing more will be written.
         self.done = False
 
@@ -662,25 +752,52 @@ class LogTail:
                 data = handle.read(LOG_READ)
         except OSError:
             return self.done
-        if not data:
-            return True
         full = len(data) == LOG_READ
-        end = data.rfind(b"\n")
-        complete = data if (self.done and not full) else data[: end + 1]
-        if not complete:
-            return not full
-        lines = complete.decode("utf-8", "replace").splitlines()
+        # Consumed up to the last \n or \r: both are single bytes that never
+        # sit inside a UTF-8 character, so what is left over decodes on its
+        # own next time. A read full of neither is taken whole, cut back to
+        # the start of a character.
+        end = max(data.rfind(b"\n"), data.rfind(b"\r")) + 1
+        if end == 0 and full:
+            end = _whole(data)
+        if self.done and not full:
+            end = len(data)
+        screen = self.screen.copy()
+        lines = screen.write(data[:end].decode("utf-8", "replace"))
+        rest = screen.copy()
+        rest.write(data[end : _whole(data) if end < len(data) else end].decode("utf-8", "replace"))
+        partial: Optional[str] = rest.text or None
+        if self.done and not full:
+            if partial is not None:
+                lines.append(partial)
+            partial = None
+            screen = Screen()
         if self.secrets:
             lines = [redact(line, self.secrets) for line in lines]
-        for first in range(0, len(lines), LOG_BATCH):
+            partial = redact(partial, self.secrets) if partial is not None else None
+        if not lines and partial == self.partial:
+            self.offset += end
+            self.screen = screen
+            return not full
+        for first in range(0, max(len(lines), 1), LOG_BATCH):
+            last = first + LOG_BATCH >= len(lines)
             backend.call(
                 "POST",
                 "/api/jobs/%d/logs" % self.job_id,
-                {"start": self.line + first, "lines": lines[first : first + LOG_BATCH]},
+                {
+                    "start": self.line + first,
+                    "lines": lines[first : first + LOG_BATCH],
+                    "rank": self.rank,
+                    # Only with the last batch: until then it is not the line
+                    # after the ones sent.
+                    "partial": partial if last else None,
+                },
             )
-        self.offset += len(complete)
+        self.offset += end
         self.line += len(lines)
-        return not full and len(complete) == len(data)
+        self.screen = screen
+        self.partial = partial
+        return not full
 
 
 class Running:
@@ -821,6 +938,13 @@ class Running:
         # Not `tail`: that is the method that reads the last lines for a
         # failure's message.
         self.output = LogTail(self.id, self.log_path, self.hidden)
+        #: Every stream of this job's output: the process's, and one per rank
+        #: when torchrun runs several (see ``_LAUNCHER``).
+        self.outputs = [self.output]
+        if config.gpus > 1:
+            ranked = os.path.join(logs, "job-%d.rank%%d.log" % self.id)
+            env["SMITH_RANK_LOG"] = ranked
+            self.outputs += [LogTail(self.id, ranked % rank, self.hidden, rank) for rank in range(config.gpus)]
         serve = outer.get("serve")
         if serve:
             port = int(serve)
@@ -938,14 +1062,27 @@ class Running:
             self.process.kill()
 
     def tail(self, lines: int = 6) -> str:
-        """The end of the output: on a failure, usually the line that says why."""
-        try:
-            with open(self.log_path, "rb") as handle:
-                handle.seek(0, os.SEEK_END)
-                handle.seek(max(0, handle.tell() - 4096))
-                text = handle.read().decode("utf-8", "replace")
-        except OSError:
+        """The end of the output: on a failure, usually the line that says why.
+
+        Under torchrun that line is in a rank's stream, and the job's own has
+        only torchrun's summary: the first rank that ended in a traceback is
+        the one quoted."""
+        ends = []
+        for output in self.outputs:
+            try:
+                with open(output.path, "rb") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    handle.seek(max(0, handle.tell() - 4096))
+                    ends.append(handle.read().decode("utf-8", "replace"))
+            except OSError:
+                continue
+        if not ends:
             return ""
+        text = next((end for end in ends[1:] if "Traceback" in end), ends[0])
+        # The last state of each redrawn line, without its colours: this is
+        # a message, not a terminal.
+        text = "\n".join(line.rsplit("\r", 1)[-1] for line in text.split("\n"))
+        text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
         kept = [line for line in text.splitlines() if line.strip()][-lines:]
         # It goes to the backend as the failure's message: no secret in it.
         return redact("\n".join(kept), self.hidden)[-1500:]
@@ -1105,7 +1242,7 @@ class Agent:
             self.report(int(job["id"]), "failed", "the agent could not start it: %s" % exc)
             return
         self.current.last_report = time.monotonic()
-        self.tails.append(self.current.output)
+        self.tails.extend(self.current.outputs)
         self.report(self.current.id, "running", run_id=self.current.run_id)
 
     def watch(self) -> None:
@@ -1117,7 +1254,8 @@ class Agent:
             if running.rendezvous is not None:
                 self.serving = running
                 log("job %d ended; still serving its run's rendezvous for the other nodes" % running.id)
-            running.output.done = True
+            for output in running.outputs:
+                output.done = True
             self.send_logs()
             self.current = None
             if running.stop_requested_at is not None:
@@ -1262,11 +1400,17 @@ class Agent:
         if self.config.check_gpus:
             self.check_gpus()
         self.reconcile()
+        polled = 0.0
         while True:
             # Before the heartbeat: it needs no answer from the backend to
             # start, and it is exactly the work to do while there is none.
-            self.ship()
             self.send_logs()
+            if time.monotonic() - polled < POLL_SECONDS:
+                # The output every half second, everything else every poll.
+                time.sleep(LOG_SECONDS)
+                continue
+            polled = time.monotonic()
+            self.ship()
             try:
                 self.beat()
                 if self.current is None and self.fault is None:
@@ -1277,7 +1421,7 @@ class Agent:
                 pass
             except RuntimeError as exc:
                 log(str(exc))
-            time.sleep(POLL_SECONDS)
+            time.sleep(LOG_SECONDS)
 
 
 def main() -> None:
