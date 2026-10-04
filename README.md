@@ -48,6 +48,7 @@ JSON over HTTP, with `Authorization: Bearer <SMITH_TOKEN>` when a token is set:
 | `PATCH /api/jobs/{id}` | a job's state: running, finished, failed, and the run id |
 | `POST /api/jobs/{id}/logs` | the job's output, numbered line by line |
 | `GET /api/jobs` | at start, jobs this node left running before a restart |
+| `POST /api/cache/{scope}` | only with `cache = "backend"`: `ravex cache` asks it to sign each operation on the compiled-dependency cache, `global` (read) and `workspace` (read and write); see ravex's `sign+https://` store |
 
 A claimed job may carry `secrets`, an object of names and values - an
 `HF_TOKEN`, a W&B key. smith puts them in that job's process environment only,

@@ -97,6 +97,13 @@ node that is the platform's, shared by everybody, and a cache that every node
 may write is a way to run code on the others' machines. A cache that fails
 is said in the job's output and costs nothing but the compilation.
 
+With ``cache = "backend"`` (or ``SMITH_CACHE=backend``) the cache is the
+backend's instead, and this machine holds no key to it (GPU-200): ``ravex
+cache`` asks the backend, with this agent's token, to sign each operation
+(``POST /api/cache/{scope}``). It pulls from ``global``, which machines may
+only read, then from ``workspace``, the job's owner's own, and pushes only
+there. The token goes to ``ravex cache`` alone, never to the training.
+
 **What a run could not send.** A run that ends while the backend is down does
 not wait for it - Ravex keeps the unsent metrics on disk for the next
 execution on that store, and a finished run never gets one. This agent
@@ -279,7 +286,8 @@ token = os.environ.pop("SMITH_GIT_TOKEN", "")
 # gets them.
 cache_env = {name: os.environ.pop(name) for name in ("RAVEX_CACHE_ACCESS_KEY", "RAVEX_CACHE_SECRET_KEY",
                                                        "RAVEX_CACHE_ENDPOINT", "RAVEX_CACHE_REGION",
-                                                       "RAVEX_CACHE_PATH_STYLE") if name in os.environ}
+                                                       "RAVEX_CACHE_PATH_STYLE", "RAVEX_CACHE_TOKEN")
+             if name in os.environ}
 
 
 def say(message):
@@ -296,19 +304,20 @@ def run(command, what, **kwargs):
         fail("could not " + what)
 
 
-# Pull or push some of the job's caches; a failure is said and passed.
+# Pull or push some of the job's caches; a failure is said and passed. A pull
+# goes through every store in order, each adding what the directory lacks.
 def cache(action, python, names):
-    if not spec["cache_store"]:
-        return
-    for name, directory, library in spec["caches"]:
-        if name not in names:
-            continue
-        done = subprocess.run([python, "-m", "ravex._cli", "cache", action, "--name", name, "--dir", directory,
-                               "--store", spec["cache_store"], "--with", library],
-                              stdin=subprocess.DEVNULL, env=dict(os.environ, **cache_env))
-        if done.returncode != 0:
-            say("the %s cache was not %s; what it would have held is compiled here" % (
-                name, "used" if action == "pull" else "sent"))
+    stores = spec["cache_reads"] if action == "pull" else [spec["cache_store"]]
+    for store in [store for store in stores if store]:
+        for name, directory, library in spec["caches"]:
+            if name not in names:
+                continue
+            done = subprocess.run([python, "-m", "ravex._cli", "cache", action, "--name", name, "--dir", directory,
+                                   "--store", store, "--with", library],
+                                  stdin=subprocess.DEVNULL, env=dict(os.environ, **cache_env))
+            if done.returncode != 0:
+                say("the %s cache was not %s; what it would have held is compiled here" % (
+                    name, "used" if action == "pull" else "sent"))
 
 
 tree = spec["tree"]
@@ -435,6 +444,10 @@ class Config:
     #: takes no job if they do not. On by default for hardware named
     #: ``gpu...``; ``check_gpus`` / ``SMITH_CHECK_GPUS`` say otherwise.
     check_gpus: bool = False
+    #: Whether a job's compiled dependencies are kept in the backend's cache,
+    #: through URLs it signs (see "What one machine compiled" above). Off
+    #: unless asked for: a backend without one would refuse every pull.
+    cache_service: bool = False
 
     @classmethod
     def load(cls, path: str) -> "Config":
@@ -490,6 +503,7 @@ class Config:
                 env("SMITH_CHECK_GPUS")
                 or raw.get("check_gpus", str(env("SMITH_HARDWARE") or raw.get("hardware", "local-cpu")).startswith("gpu"))
             ).lower() in ("true", "1", "yes"),
+            cache_service=str(env("SMITH_CACHE") or raw.get("cache", "")).lower() == "backend",
         )
 
 
@@ -854,13 +868,23 @@ class Running:
         ]
         for (_name, directory, _library), (_same, variable, _lib) in zip(self.caches, CACHES):
             env[variable] = directory
-        #: Where they are shared, and the keys for it: the job's owner's own
-        #: bucket, for a job that runs a repository, or nowhere.
+        #: Where they are shared, for a job that runs a repository: the
+        #: stores pulled from, in order, the one pushed to, and what ``ravex
+        #: cache`` needs to reach them - the backend's signing service, the
+        #: job's owner's own bucket, or nowhere.
+        self.cache_reads: List[str] = []
         self.cache_store = ""
         self.cache_env: Dict[str, str] = {}
         own = Bucket.from_job(job["storage"]) if job.get("storage") else None
-        if self.code is not None and own is not None and own.access_key and own.secret_key:
+        if self.code is not None and config.cache_service and config.token:
+            signed = "sign+%s/api/cache/" % config.backend
+            self.cache_reads = [signed + "global", signed + "workspace"]
+            self.cache_store = signed + "workspace"
+            self.cache_env = {"RAVEX_CACHE_TOKEN": config.token}
+            env.update(self.cache_env)
+        elif self.code is not None and own is not None and own.access_key and own.secret_key:
             self.cache_store = "s3://%s/%s" % (own.bucket, own.prefix_of("_cache"))
+            self.cache_reads = [self.cache_store]
             self.cache_env = {"RAVEX_CACHE_ACCESS_KEY": own.access_key, "RAVEX_CACHE_SECRET_KEY": own.secret_key}
             if own.endpoint:
                 self.cache_env["RAVEX_CACHE_ENDPOINT"] = str(own.endpoint)
@@ -990,6 +1014,7 @@ class Running:
                     "launcher_file": launcher,
                     "flags": flags(job.get("params") or {}),
                     "caches": self.caches,
+                    "cache_reads": self.cache_reads,
                     "cache_store": self.cache_store,
                 }
             )
