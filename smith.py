@@ -591,7 +591,11 @@ class Backend:
     def __init__(self, base: str, token: Optional[str] = None) -> None:
         self.base = base
         self._down_since: Optional[float] = None
-        self._headers = {"Content-Type": "application/json"}
+        # A name of its own: urllib's default, Python-urllib/3.x, is one that
+        # a CDN in front of a backend may refuse outright as a bot (Cloudflare
+        # answers 403 with error 1010), and every call would fail before it
+        # reached the backend.
+        self._headers = {"Content-Type": "application/json", "User-Agent": "smith"}
         if token:
             self._headers["Authorization"] = "Bearer " + token
 
