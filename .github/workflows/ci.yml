@@ -35,7 +35,7 @@ jobs:
   image:
     # The CPU image from PyPI: proves the repository builds on its own, without
     # any checkout of the libraries. The GPU image is the same recipe with gigabytes more
-    # torch, so it is left to whoever pushes it to a registry.
+    # torch: it is built and pushed by image.yml, on a push to the deploy branch.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
