@@ -34,8 +34,8 @@ docker build -t smith --build-arg LIBS=source \
 
 The GPU image is published by pushing to the `deploy` branch
 (`git push origin main:deploy`): `.github/workflows/image.yml` builds it from
-PyPI and pushes `ghcr.io/<owner>/smith-gpu:<commit>`, tagged with smith's
-short commit, then checks the tag is in the registry.
+PyPI and pushes it as `ghcr.io/<owner>/smith-gpu:<commit>`, smith's short
+commit, and as `:latest`, then checks both tags are in the registry.
 
 ## What it expects of a backend
 

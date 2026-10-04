@@ -5,8 +5,11 @@ name: GPU image
 # that branch, because the image is gigabytes and each push is a new tag that
 # a backend may start nodes with; main only runs the checks in ci.yml.
 #
-# The tag is smith's commit. The libraries are pinned in Dockerfile.gpu, so
-# that commit is everything that decides what is in the image.
+# Two tags: smith's commit, which says exactly what is in the image (the
+# libraries are pinned in Dockerfile.gpu, so the commit decides it all), and
+# `latest`, which a backend can name once and never change again: the deploy
+# branch is the deliberate step, so the newest image it published is the one
+# to start nodes with.
 
 on:
   push:
@@ -36,7 +39,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Tag
         id: tag
-        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/smith-gpu:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/smith-gpu"
+          echo "image=$repo:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "latest=$repo:latest" >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -48,10 +54,14 @@ jobs:
           context: .
           file: Dockerfile.gpu
           push: true
-          tags: ${{ steps.tag.outputs.image }}
+          tags: |
+            ${{ steps.tag.outputs.image }}
+            ${{ steps.tag.outputs.latest }}
       # A tag that is not in the registry only shows up later, as a node that
       # never boots: check it here, where the failure is still readable.
       - name: The tag is in the registry
-        run: docker manifest inspect "${{ steps.tag.outputs.image }}" > /dev/null
+        run: |
+          docker manifest inspect "${{ steps.tag.outputs.image }}" > /dev/null
+          docker manifest inspect "${{ steps.tag.outputs.latest }}" > /dev/null
       - name: Summary
-        run: echo "Pushed \`${{ steps.tag.outputs.image }}\`" >> "$GITHUB_STEP_SUMMARY"
+        run: echo "Pushed \`${{ steps.tag.outputs.image }}\`, now also \`latest\`" >> "$GITHUB_STEP_SUMMARY"
