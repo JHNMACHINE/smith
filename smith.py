@@ -104,6 +104,11 @@ cache`` asks the backend, with this agent's token, to sign each operation
 only read, then from ``workspace``, the job's owner's own, and pushes only
 there. The token goes to ``ravex cache`` alone, never to the training.
 
+The kernels go back while the job runs too, not only when it ends: five
+minutes in and then every fifteen, the files that have stopped changing. A
+node the provider takes back never reaches the end, and before this lost
+everything it had compiled.
+
 **What a run could not send.** A run that ends while the backend is down does
 not wait for it - Ravex keeps the unsent metrics on disk for the next
 execution on that store, and a finished run never gets one. This agent
@@ -175,16 +180,55 @@ CACHES = (
     ("tilelang", "TILELANG_CACHE_DIR", "tilelang"),
 )
 
-#: After a job, the kernels it compiled go back to its cache: one process for
-#: all of them, in the job's own interpreter, so the key is the training's.
+#: The kernels a job compiled go back to its cache: one process for all of
+#: them, in the job's own interpreter, so the key is the training's. After the
+#: job, every file. While it runs (``settled`` set), only the files that have
+#: not changed for that many seconds and are not a library's temporary,
+#: linked into a snapshot beside the directory and pushed from there: a file
+#: half-written when the push read it would be stored under its final name,
+#: and every later push would skip it as already there.
 _PUSH_KERNELS = r"""
-import json, subprocess, sys
+import json, os, shutil, subprocess, sys, time
 spec = json.loads(sys.argv[1])
+settled = spec.get("settled")
 for name, directory, library in spec["caches"]:
+    source = directory
+    if settled:
+        source = directory.rstrip("/\\") + ".push"
+        shutil.rmtree(source, ignore_errors=True)
+        cutoff = time.time() - settled
+        for folder, _dirs, files in os.walk(directory):
+            for file in files:
+                path = os.path.join(folder, file)
+                try:
+                    if ".tmp" in file or os.path.getmtime(path) > cutoff:
+                        continue
+                    target = os.path.join(source, os.path.relpath(path, directory))
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    try:
+                        os.link(path, target)
+                    except OSError:
+                        shutil.copy2(path, target)
+                except OSError:
+                    continue
     subprocess.run([spec["python"], "-m", "ravex._cli", "cache", "push", "--name", name,
-                    "--dir", directory, "--store", spec["store"], "--with", library],
+                    "--dir", source, "--store", spec["store"], "--with", library],
                    stdin=subprocess.DEVNULL)
+    if source != directory:
+        shutil.rmtree(source, ignore_errors=True)
 """
+
+#: While a job runs, its kernels go to its cache this long after it started
+#: and then this often, not only when it ends: a node the provider takes back
+#: never reaches the end, and everything it compiled was lost with it. The
+#: first push comes once the first steps have compiled most of what the
+#: training needs; later ones pick up what eval, a recompile or a checkpoint
+#: compiled since. Each sends only the names the cache lacks.
+KERNEL_PUSH_FIRST_SECONDS = 300.0
+KERNEL_PUSH_EVERY_SECONDS = 900.0
+
+#: How long a kernel file must have stayed unchanged to be pushed mid-run.
+KERNEL_SETTLED_SECONDS = 120.0
 
 #: Runs the script the way ``python script.py`` would, with one difference: a
 #: stop request arrives as ``KeyboardInterrupt``. On Windows the only signal
@@ -832,6 +876,10 @@ class Running:
         self.id = int(job["id"])
         self.stop_requested_at: Optional[float] = None
         self.last_report = 0.0
+        #: When its kernels next go to its cache while it runs, and the push
+        #: under way, so that two never overlap.
+        self.next_push = time.monotonic() + KERNEL_PUSH_FIRST_SECONDS
+        self.mid_push: Optional[subprocess.Popen] = None
 
         #: The repository's commit this job runs, checked; None for one of
         #: this agent's own scripts.
@@ -1128,11 +1176,13 @@ class Running:
     def close(self) -> None:
         self._log.close()
 
-    def push_caches(self, config: Config) -> Optional[subprocess.Popen]:
+    def push_caches(self, config: Config, settled: Optional[float] = None) -> Optional[subprocess.Popen]:
         """Send the job's cache the kernels it compiled, in the background.
 
         With the interpreter the preparer recorded, the one the training ran
         in; a job that never got that far compiled nothing worth sending.
+        ``settled`` is for a push while the job runs (see ``_PUSH_KERNELS``).
+        At a lower priority on Linux, so it takes what the training leaves.
         """
         if not self.cache_store or self.code is None:
             return None
@@ -1143,18 +1193,34 @@ class Running:
         except (OSError, ValueError, KeyError):
             return None
         kernels = [entry for entry in self.caches if entry[0] != "uv"]
+        spec: Dict[str, Any] = {"python": python, "store": self.cache_store, "caches": kernels}
+        if settled:
+            spec["settled"] = settled
+        extra: Dict[str, Any] = {}
+        if hasattr(os, "nice"):
+            extra["preexec_fn"] = lambda: os.nice(10)
         out = open(os.path.join(config.runs, "_logs", "job-%d.cache.log" % self.id), "ab")
         try:
             return subprocess.Popen(
-                [config.python, "-c", _PUSH_KERNELS,
-                 json.dumps({"python": python, "store": self.cache_store, "caches": kernels})],
+                [config.python, "-c", _PUSH_KERNELS, json.dumps(spec)],
                 env=dict(os.environ, **self.cache_env),
                 stdout=out,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
+                **extra,
             )
         finally:
             out.close()
+
+    def push_while_running(self, config: Config) -> None:
+        """Send the kernels compiled so far, when it is time and the last push
+        has finished; one that cannot start yet (the job is still preparing)
+        is tried again at the next interval."""
+        now = time.monotonic()
+        if now < self.next_push or (self.mid_push is not None and self.mid_push.poll() is None):
+            return
+        self.next_push = now + KERNEL_PUSH_EVERY_SECONDS
+        self.mid_push = self.push_caches(config, settled=KERNEL_SETTLED_SECONDS)
 
     def stop_rendezvous(self) -> None:
         """Stop serving the run's rendezvous, if this job started one.
@@ -1315,6 +1381,7 @@ class Agent:
         if running.stop_requested_at is not None:
             running.stop()
             return
+        running.push_while_running(self.config)
         if time.monotonic() - running.last_report >= REPORT_SECONDS:
             running.last_report = time.monotonic()
             answer = self.report(running.id, "running", run_id=running.run_id)
