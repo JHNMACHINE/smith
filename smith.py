@@ -979,6 +979,11 @@ class Running:
                 env.update(bucket.environment(bucket.prefix_in(source) or self.run_id))
             else:
                 store = source
+            # It must carry on: with no checkpoint in the store, here or in
+            # the bucket, the run stops instead of training from step 0 under
+            # the same name. On 2026-10-08 a resume on a new node found none,
+            # started over and overwrote the run's identity in the bucket.
+            env["RAVEX_REQUIRE_RESUME"] = "1"
             if job["mode"] == "update":
                 # Parameters somebody changed on a run: the script's
                 # new ones win over the checkpoint's, or a new learning rate
