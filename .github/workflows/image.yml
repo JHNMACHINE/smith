@@ -54,6 +54,10 @@ jobs:
           context: .
           file: Dockerfile.gpu
           push: true
+          # Which image this is, from inside it: smith writes it at the top
+          # of each job's output.
+          build-args: |
+            SMITH_IMAGE=${{ steps.tag.outputs.image }}
           tags: |
             ${{ steps.tag.outputs.image }}
             ${{ steps.tag.outputs.latest }}

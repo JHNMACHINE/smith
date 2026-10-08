@@ -152,4 +152,10 @@ COPY --from=wheels /bench /app/bench
 COPY . /app/smith
 WORKDIR /app
 
+# The tag this image is published as, which smith writes at the top of every
+# job's output: `latest` moves, and a host may start a node from an older
+# copy of it. Last, so a new tag rebuilds nothing above.
+ARG SMITH_IMAGE=""
+ENV SMITH_IMAGE=${SMITH_IMAGE}
+
 CMD ["python", "smith/smith.py", "--config", "smith/smith.gpu.toml"]

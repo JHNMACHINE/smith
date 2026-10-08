@@ -92,6 +92,8 @@ On a node, what differs between machines comes from the environment:
 `SMITH_BACKEND`, `SMITH_TOKEN`, `SMITH_NAME`,
 `SMITH_HARDWARE`, `SMITH_GPUS`, `SMITH_STORAGE_*`, and the
 bucket's `RAVEX_S3_ACCESS_KEY` / `RAVEX_S3_SECRET_KEY`.
+`SMITH_IMAGE`, which the GPU image sets to its own tag, is written as the first
+line of every job's output: `[smith] image ghcr.io/.../smith-gpu:<commit>`.
 
 **The GPU check.** On hardware named `gpu...`, smith first asks the
 interpreter that runs the training whether its GPUs work: torch sees CUDA, as

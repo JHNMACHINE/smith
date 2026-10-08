@@ -158,6 +158,12 @@ LOG_SECONDS = 0.5
 
 TIMEOUT = 10.0
 
+#: The image this agent runs in, as the build that made it named it
+#: (``SMITH_IMAGE``, set in Dockerfile.gpu); empty outside one. Written at the
+#: top of every job's output, because a node that started from an older copy
+#: of a moving tag otherwise looks exactly like one that did not.
+IMAGE = os.environ.get("SMITH_IMAGE", "").strip()
+
 #: The compiled directories a job keeps, by name in the cache: the variable
 #: that points the tool at it, and the library whose version is part of what
 #: the files were built for. ``uv`` is the wheels it built from source, which
@@ -963,6 +969,9 @@ class Running:
         os.makedirs(logs, exist_ok=True)
         self.log_path = os.path.join(logs, "job-%d.log" % self.id)
         self._log = open(self.log_path, "ab")
+        if IMAGE:
+            self._log.write(("[smith] image %s\n" % IMAGE).encode("utf-8"))
+            self._log.flush()
         # Not `tail`: that is the method that reads the last lines for a
         # failure's message.
         self.output = LogTail(self.id, self.log_path, self.hidden)
