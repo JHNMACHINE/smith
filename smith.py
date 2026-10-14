@@ -102,7 +102,13 @@ backend's instead, and this machine holds no key to it (GPU-200): ``ravex
 cache`` asks the backend, with this agent's token, to sign each operation
 (``POST /api/cache/{scope}``). It pulls from ``global``, which machines may
 only read, then from ``workspace``, the job's owner's own, and pushes only
-there. The token goes to ``ravex cache`` alone, never to the training.
+there. The token is this agent's own, which the run already has for its
+metrics (``RAVEX_METRICS_TOKEN``) and could read here anyway: the training
+runs as the same user in the same container, and the token is in this
+agent's environment. What keeps the cache safe is not who holds the token
+but what the backend lets a workspace do with it - read ``global``, write
+only its own, up to its quota - so a script, or a library it imports, can
+reach no further than its owner's own cache.
 
 The kernels go back while the job runs too, not only when it ends: five
 minutes in and then every fifteen, the files that have stopped changing. A
@@ -336,8 +342,11 @@ import base64, json, os, shutil, signal, subprocess, sys, tomllib
 
 spec = json.loads(os.environ.pop("SMITH_PREPARE"))
 token = os.environ.pop("SMITH_GIT_TOKEN", "")
-# The cache's keys stay out of the training's environment; only `ravex cache`
-# gets them.
+# The cache's credentials go to `ravex cache` and not into the training's
+# environment, where a library that reports the environment would carry them
+# off. A boundary they are not: the training runs as this process's user and
+# can read them all the same, and the backend's token is in its environment
+# for the metrics anyway (GPU-200).
 cache_env = {name: os.environ.pop(name) for name in ("RAVEX_CACHE_ACCESS_KEY", "RAVEX_CACHE_SECRET_KEY",
                                                        "RAVEX_CACHE_ENDPOINT", "RAVEX_CACHE_REGION",
                                                        "RAVEX_CACHE_PATH_STYLE", "RAVEX_CACHE_TOKEN")
