@@ -321,6 +321,10 @@ _REPO = re.compile(r"^https://[A-Za-z0-9.-]+(?::\d+)?/[A-Za-z0-9_.~/-]+$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _RELATIVE = re.compile(r"^(?!/)(?!.*\.\.)[A-Za-z0-9_./-]{1,200}$")
 _SCRIPT = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+#: What a parameter's name may be: it becomes a flag, ``--name``. Checked with
+#: ``fullmatch`` like the others, since ``$`` alone also matches before a
+#: final newline.
+_PARAM = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
 
 #: A job with ``code`` runs this first, as its own process: fetch the commit,
 #: make its environment, find the script in the manifest, then become the
@@ -698,8 +702,13 @@ def new_run_id() -> str:
 
 
 def flags(params: Dict[str, Any]) -> List[str]:
+    """A job's parameters as the flags its script is started with. A name that
+    is not a flag's is refused rather than passed on: a backend's word is not
+    enough for what lands on a command line."""
     out: List[str] = []
     for key, value in params.items():
+        if not isinstance(key, str) or not _PARAM.fullmatch(key):
+            raise RuntimeError("%r is not a parameter's name" % (key,))
         if value is True:
             out.append("--" + key)
         elif value is False or value is None:
@@ -1133,13 +1142,13 @@ class Running:
         code = job["code"]
         repo, commit = str(code.get("repo") or ""), str(code.get("commit") or "")
         manifest = str(code.get("manifest") or "")
-        if not _REPO.match(repo) or ".." in repo:
+        if not _REPO.fullmatch(repo) or ".." in repo:
             raise RuntimeError("%r is not a repository this agent fetches: an https address" % repo)
-        if not _SHA.match(commit):
+        if not _SHA.fullmatch(commit):
             raise RuntimeError("%r is not a commit: a full SHA, 40 hexadecimal characters" % commit)
-        if not _RELATIVE.match(manifest):
+        if not _RELATIVE.fullmatch(manifest):
             raise RuntimeError("%r is not a file of a repository" % manifest)
-        if not _SCRIPT.match(str(job.get("script") or "")):
+        if not _SCRIPT.fullmatch(str(job.get("script") or "")):
             raise RuntimeError("%r is not a script's name" % job.get("script"))
         # One directory per repository, its commits side by side.
         place = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo.split("://", 1)[1]).strip("-")
