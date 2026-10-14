@@ -113,7 +113,10 @@ reach no further than its owner's own cache.
 The kernels go back while the job runs too, not only when it ends: five
 minutes in and then every fifteen, the files that have stopped changing. A
 node the provider takes back never reaches the end, and before this lost
-everything it had compiled.
+everything it had compiled. The push after the job goes on after it, a
+request and an upload per file, and every heartbeat says so (``pushing``)
+until it is over: a backend that gives back idle machines would otherwise
+count this one idle from the job's end and take it halfway through.
 
 **What a run could not send.** A run that ends while the backend is down does
 not wait for it - Ravex keeps the unsent metrics on disk for the next
@@ -1345,6 +1348,8 @@ class Agent:
                 # Only when there is one: a backend that knows nothing of it
                 # is not sent a field it would have to ignore.
                 **({"fault": self.fault} if self.fault else {}),
+                # A finished job's kernels still on their way to the cache.
+                **({"pushing": True} if any(p.poll() is None for p in self.pushing) else {}),
             },
         )
 
