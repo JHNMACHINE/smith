@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Checks only: the token reads the repository and does nothing else.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
