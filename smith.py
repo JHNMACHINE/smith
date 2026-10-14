@@ -572,6 +572,9 @@ class Bucket:
     #: the repr, so that printing a bucket never prints them.
     access_key: Optional[str] = field(default=None, repr=False)
     secret_key: Optional[str] = field(default=None, repr=False)
+    #: With temporary keys, the token they sign nothing without: a backend
+    #: may hand ones scoped to this bucket, or to its prefix, for a time.
+    session_token: Optional[str] = field(default=None, repr=False)
 
     @classmethod
     def from_job(cls, table: Dict[str, Any]) -> "Bucket":
@@ -591,6 +594,7 @@ class Bucket:
             path_style=bool(table.get("path_style")),
             access_key=str(table["access_key"]),
             secret_key=str(table["secret_key"]),
+            session_token=str(table["session_token"]) if table.get("session_token") else None,
         )
 
     @classmethod
@@ -641,6 +645,8 @@ class Bucket:
         if self.access_key and self.secret_key:
             env["RAVEX_S3_ACCESS_KEY"] = self.access_key
             env["RAVEX_S3_SECRET_KEY"] = self.secret_key
+            if self.session_token:
+                env["RAVEX_S3_SESSION_TOKEN"] = self.session_token
         return env
 
 
@@ -914,6 +920,8 @@ class Running:
         if bucket is not None and bucket.access_key and bucket.secret_key:
             self.hidden["STORAGE_ACCESS_KEY"] = bucket.access_key
             self.hidden["STORAGE_SECRET_KEY"] = bucket.secret_key
+            if bucket.session_token:
+                self.hidden["STORAGE_SESSION_TOKEN"] = bucket.session_token
         if self.code is not None and self.code.get("token"):
             self.hidden["GIT_TOKEN"] = str(self.code["token"])
         #: The compiled directories, on this machine for every job.
@@ -936,7 +944,9 @@ class Running:
             self.cache_store = signed + "workspace"
             self.cache_env = {"RAVEX_CACHE_TOKEN": config.token}
             env.update(self.cache_env)
-        elif self.code is not None and own is not None and own.access_key and own.secret_key:
+        # Not with temporary keys: Ravex's cache signs with permanent ones
+        # only, and keys scoped to the runs' prefix would not reach _cache.
+        elif self.code is not None and own is not None and own.access_key and own.secret_key and not own.session_token:
             self.cache_store = "s3://%s/%s" % (own.bucket, own.prefix_of("_cache"))
             self.cache_reads = [self.cache_store]
             self.cache_env = {"RAVEX_CACHE_ACCESS_KEY": own.access_key, "RAVEX_CACHE_SECRET_KEY": own.secret_key}
