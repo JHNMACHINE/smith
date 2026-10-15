@@ -23,7 +23,7 @@ jobs:
           python-version: "3.11"
       # smith is standard library only: it has to compile and start on the
       # oldest Python it claims, with nothing installed.
-      - run: python -m py_compile smith.py
+      - run: python -m py_compile smith.py builder.py
       - run: python smith.py --help
       - name: Every config parses
         run: |

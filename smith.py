@@ -111,6 +111,13 @@ but what the backend lets a workspace do with it - read ``global``, write
 only its own, up to its quota - so a script, or a library it imports, can
 reach no further than its owner's own cache.
 
+The ``global`` part is filled by the backend's builder (``builder.py``,
+GPU-202), never by a node. After the install this machine reports, by name,
+the wheels uv still had to compile; the builder compiles them again from
+PyPI's source for this machine's ``ravex cache key --name wheels``, and the
+next machine like this one pulls them as ``wheels`` and hands them to uv with
+``--find-links``, where a wheel wins over the sdist of the same version.
+
 The kernels go back while the job runs too, not only when it ends: five
 minutes in and then every fifteen, the files that have stopped changing. A
 node the provider takes back never reaches the end, and before this lost
@@ -342,7 +349,7 @@ _PARAM = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
 #: install of several minutes neither stop the heartbeats nor escape the
 #: job's output, and a stop reaches them like it reaches the training.
 _PREPARE = r"""
-import base64, json, os, shutil, signal, subprocess, sys, time, tomllib
+import base64, json, os, shutil, signal, subprocess, sys, time, tomllib, urllib.request
 
 # Every step says how long it took, from this process's start: the job's log
 # is the only place the time of a node's start can be read from, and its lines
@@ -398,6 +405,58 @@ def cache(action, python, names):
                 took("%s the %s cache" % ("pulled" if action == "pull" else "pushed", name), since)
 
 
+# The wheels the backend's builder compiled for this machine's key, from the
+# cache's global part, which only that builder writes: no --with, since what a
+# wheel was built against is the interpreter, torch and the GPUs, not the uv
+# that installs it.
+def wheels_pull():
+    if not spec["wheels_store"]:
+        return
+    since = time.monotonic()
+    done = subprocess.run([sys.executable, "-m", "ravex._cli", "cache", "pull", "--name", "wheels",
+                           "--dir", spec["wheels"], "--store", spec["wheels_store"]],
+                          stdin=subprocess.DEVNULL, env=dict(os.environ, **cache_env))
+    if done.returncode != 0:
+        say("the builder's wheels were not used after %.1f s; what they would have been is compiled here"
+            % (time.monotonic() - since))
+    else:
+        took("pulled the builder's wheels", since)
+
+
+# What uv still had to compile here, by name, for the backend's builder to
+# compile from PyPI's source for the next machine like this one. Only names:
+# nothing this machine made goes where every machine reads. The wheels uv
+# built are the ones `uv cache prune --ci` left in its sdists bucket.
+def wheels_report():
+    if not spec["wheels_report"]:
+        return
+    have = set(os.listdir(spec["wheels"])) if os.path.isdir(spec["wheels"]) else set()
+    built = {}
+    for folder, _dirs, files in os.walk(os.environ.get("UV_CACHE_DIR", "")):
+        if os.sep + "sdists-" not in folder:
+            continue
+        for file in files:
+            parts = file.split("-")
+            if file.endswith(".whl") and file not in have and len(parts) >= 5:
+                built[(parts[0], parts[1])] = None
+    if not built:
+        return
+    try:
+        key = json.loads(subprocess.run([sys.executable, "-m", "ravex._cli", "cache", "key", "--name", "wheels"],
+                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True).stdout)
+        body = json.dumps({"key": key, "wheels": [{"name": n, "version": v} for n, v in sorted(built)]}).encode()
+        request = urllib.request.Request(spec["wheels_report"], data=body, method="POST", headers={
+            "Content-Type": "application/json", "User-Agent": "smith",
+            "Authorization": "Bearer " + cache_env.get("RAVEX_CACHE_TOKEN", "")})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            answer = json.loads(response.read().decode() or "{}")
+        for wheel in answer.get("queued", []):
+            say("%s %s was compiled here; the builder will compile it for the next machine like this one" % (
+                wheel["name"], wheel["version"]))
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        say("the compiled wheels were not reported: %s" % exc)
+
+
 tree = spec["tree"]
 ready = os.path.join(tree, ".smith-ready")
 short = spec["commit"][:12]
@@ -427,6 +486,7 @@ else:
     # Before the install, with this interpreter: the wheels are built against
     # what it has, which is what the new environment starts from.
     cache("pull", python, ("uv",))
+    wheels_pull()
     wants = "requirements.txt" if os.path.isfile(os.path.join(tree, "requirements.txt")) else (
         "pyproject.toml" if os.path.isfile(os.path.join(tree, "pyproject.toml")) else None)
     if wants:
@@ -435,18 +495,22 @@ else:
         python = os.path.join(venv, "Scripts", "python.exe") if os.name == "nt" else os.path.join(venv, "bin", "python")
         what = ["-r", "requirements.txt"] if wants == "requirements.txt" else ["."]
         say("installing what %s asks for" % wants)
+        # A wheel there wins over the sdist of the same version on PyPI, so
+        # what the builder compiled is installed instead of compiled again.
+        find_links = ["--find-links", spec["wheels"]] if os.path.isdir(spec["wheels"]) and os.listdir(spec["wheels"]) else []
         since = time.monotonic()
         uv = shutil.which("uv")
         if uv:
-            run([uv, "pip", "install", "--python", python] + what, "install the dependencies", cwd=tree)
+            run([uv, "pip", "install", "--python", python] + find_links + what, "install the dependencies", cwd=tree)
             took("installed", since)
             if spec["cache_store"]:
                 # What it downloaded is out, what it built stays: the cache is
                 # then only the wheels nobody publishes for this machine.
                 subprocess.run([uv, "cache", "prune", "--ci", "-q"], stdin=subprocess.DEVNULL)
                 cache("push", sys.executable, ("uv",))
+                wheels_report()
         else:
-            run([python, "-m", "pip", "install", "--disable-pip-version-check", "-q"] + what,
+            run([python, "-m", "pip", "install", "--disable-pip-version-check", "-q"] + find_links + what,
                 "install the dependencies", cwd=tree)
             took("installed", since)
     with open(ready, "w", encoding="utf-8") as handle:
@@ -975,11 +1039,19 @@ class Running:
         self.cache_reads: List[str] = []
         self.cache_store = ""
         self.cache_env: Dict[str, str] = {}
+        #: The wheels the backend's builder compiled for machines like this
+        #: one, handed to uv as ``--find-links``, and where to report the ones
+        #: this machine still had to compile so the builder does them next.
+        self.wheels = os.path.join(config.runs, "_cache", "wheels")
+        self.wheels_store = ""
+        self.wheels_report = ""
         own = Bucket.from_job(job["storage"]) if job.get("storage") else None
         if self.code is not None and config.cache_service and config.token:
             signed = "sign+%s/api/cache/" % config.backend
             self.cache_reads = [signed + "global", signed + "workspace"]
             self.cache_store = signed + "workspace"
+            self.wheels_store = signed + "global"
+            self.wheels_report = "%s/api/cache-builds" % config.backend
             self.cache_env = {"RAVEX_CACHE_TOKEN": config.token}
             env.update(self.cache_env)
         # Not with temporary keys: Ravex's cache signs with permanent ones
@@ -1126,6 +1198,9 @@ class Running:
                     "caches": self.caches,
                     "cache_reads": self.cache_reads,
                     "cache_store": self.cache_store,
+                    "wheels": self.wheels,
+                    "wheels_store": self.wheels_store,
+                    "wheels_report": self.wheels_report,
                 }
             )
             if self.code.get("token"):
