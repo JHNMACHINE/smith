@@ -36,7 +36,8 @@ makes a virtual environment beside it when the repository has a
 ``requirements.txt`` or a ``pyproject.toml`` (on top of this Python's own
 packages, so torch and Ravex are there already; with ``uv`` when it is
 installed) and then runs the script with the job's parameters as flags. A
-commit already fetched is used again. Every step is in the job's output. It
+commit already fetched is used again. Every step is in the job's output, with
+how long it took (GPU-219). It
 is still never a command: a repository, a commit and a name, each checked.
 It is opt-in because it runs whatever the repository holds: on a machine of
 the person whose repository it is, or one rented for them, that is the point;
@@ -341,8 +342,12 @@ _PARAM = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
 #: install of several minutes neither stop the heartbeats nor escape the
 #: job's output, and a stop reaches them like it reaches the training.
 _PREPARE = r"""
-import base64, json, os, shutil, signal, subprocess, sys, tomllib
+import base64, json, os, shutil, signal, subprocess, sys, time, tomllib
 
+# Every step says how long it took, from this process's start: the job's log
+# is the only place the time of a node's start can be read from, and its lines
+# carry no time of their own (GPU-219).
+began = time.monotonic()
 spec = json.loads(os.environ.pop("SMITH_PREPARE"))
 token = os.environ.pop("SMITH_GIT_TOKEN", "")
 # The cache's credentials go to `ravex cache` and not into the training's
@@ -358,6 +363,10 @@ cache_env = {name: os.environ.pop(name) for name in ("RAVEX_CACHE_ACCESS_KEY", "
 
 def say(message):
     print("[smith] " + message, flush=True)
+
+
+def took(what, since):
+    say("%s in %.1f s" % (what, time.monotonic() - since))
 
 
 def fail(message):
@@ -378,12 +387,15 @@ def cache(action, python, names):
         for name, directory, library in spec["caches"]:
             if name not in names:
                 continue
+            since = time.monotonic()
             done = subprocess.run([python, "-m", "ravex._cli", "cache", action, "--name", name, "--dir", directory,
                                    "--store", store, "--with", library],
                                   stdin=subprocess.DEVNULL, env=dict(os.environ, **cache_env))
             if done.returncode != 0:
-                say("the %s cache was not %s; what it would have held is compiled here" % (
-                    name, "used" if action == "pull" else "sent"))
+                say("the %s cache was not %s after %.1f s; what it would have held is compiled here" % (
+                    name, "used" if action == "pull" else "sent", time.monotonic() - since))
+            else:
+                took("%s the %s cache" % ("pulled" if action == "pull" else "pushed", name), since)
 
 
 tree = spec["tree"]
@@ -398,6 +410,7 @@ else:
     shutil.rmtree(tree, ignore_errors=True)
     os.makedirs(tree)
     say("fetching %s at %s" % (spec["repo"], short))
+    since = time.monotonic()
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     if token:
         # In git's environment, where other users of the machine cannot read
@@ -409,6 +422,7 @@ else:
     run(["git", "-C", tree, "fetch", "-q", "--depth", "1", spec["repo"], spec["commit"]],
         "fetch commit %s; is the repository right, and is a private one given its token?" % short, env=env)
     run(["git", "-C", tree, "checkout", "-q", "--detach", "FETCH_HEAD"], "check out " + short, env=env)
+    took("fetched", since)
     python = sys.executable
     # Before the install, with this interpreter: the wheels are built against
     # what it has, which is what the new environment starts from.
@@ -421,9 +435,11 @@ else:
         python = os.path.join(venv, "Scripts", "python.exe") if os.name == "nt" else os.path.join(venv, "bin", "python")
         what = ["-r", "requirements.txt"] if wants == "requirements.txt" else ["."]
         say("installing what %s asks for" % wants)
+        since = time.monotonic()
         uv = shutil.which("uv")
         if uv:
             run([uv, "pip", "install", "--python", python] + what, "install the dependencies", cwd=tree)
+            took("installed", since)
             if spec["cache_store"]:
                 # What it downloaded is out, what it built stays: the cache is
                 # then only the wheels nobody publishes for this machine.
@@ -432,6 +448,7 @@ else:
         else:
             run([python, "-m", "pip", "install", "--disable-pip-version-check", "-q"] + what,
                 "install the dependencies", cwd=tree)
+            took("installed", since)
     with open(ready, "w", encoding="utf-8") as handle:
         json.dump({"python": python}, handle)
 
@@ -459,7 +476,7 @@ if spec["gpus"] > 1:
 else:
     command = [python, "-c", spec["launcher"], script]
 command += spec["flags"]
-say("running %s" % spec["script"])
+say("running %s, %.1f s after the job started" % (spec["script"], time.monotonic() - began))
 os.chdir(root)
 if os.name == "nt":
     # No exec on Windows: wait for the training, and leave a stop to it.
