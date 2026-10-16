@@ -48,7 +48,7 @@ command line, and never the training process.
 **One run on several nodes.** A job that is one node's part of a run trained
 by several - Ravex's outer loop - says so in ``outer``: ``member``, the name of
 this node's own store inside the run's (two nodes writing one store would
-overwrite each other); ``token``, the run's ``RAVEX_JOB_TOKEN``, which keeps
+overwrite each other), which a resume of the run resumes too; ``token``, the run's ``RAVEX_JOB_TOKEN``, which keeps
 anyone else out of its rendezvous; and on the node that hosts it, ``serve``:
 the port of a ``ravex rendezvous`` this agent starts beside the script and
 keeps serving after it, for the nodes still training, until it takes its next
@@ -1091,14 +1091,17 @@ class Running:
             # The same run carrying on, from its newest checkpoint: the store
             # is the run's own, and Ravex resumes from what is in it.
             self.run_id = str(job["source_run_id"])
+            # A node's part of a run on several resumes its own store, inside
+            # the run's, as it wrote it: the same member it was.
+            mine = [self.member] if self.member else []
             if bucket is not None and source.startswith("s3://"):
                 # Back in the bucket under the same prefix. The staging copy is
                 # this machine's; when it is empty - a different node from the
                 # one that trained the run - Ravex brings the store down first.
-                store = os.path.join(config.runs, self.run_id)
-                env.update(bucket.environment(bucket.prefix_in(source) or self.run_id))
+                store = os.path.join(config.runs, self.run_id, *mine)
+                env.update(bucket.environment("/".join([bucket.prefix_in(source) or self.run_id] + mine)))
             else:
-                store = source
+                store = os.path.join(source, *mine)
             # It must carry on: with no checkpoint in the store, here or in
             # the bucket, the run stops instead of training from step 0 under
             # the same name. On 2026-10-08 a resume on a new node found none,
