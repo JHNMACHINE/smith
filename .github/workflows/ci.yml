@@ -23,7 +23,7 @@ jobs:
           python-version: "3.11"
       # smith is standard library only: it has to compile and start on the
       # oldest Python it claims, with nothing installed.
-      - run: python -m py_compile smith.py builder.py
+      - run: python -m py_compile smith.py builder.py cache.py
       - run: python smith.py --help
       - name: Every config parses
         run: |
@@ -35,6 +35,11 @@ jobs:
               assert config.get("scripts"), path
               print("ok", path)
           EOF
+      # pytest for the tests only, after the checks above have run on a bare
+      # interpreter. Without Moonclip the bucket's tests skip: those run where
+      # there is an S3 server (tests/test_cache_s3.py says how).
+      - run: python -m pip install --quiet pytest
+      - run: python -m pytest tests -q
 
   image:
     # The CPU image from PyPI: proves the repository builds on its own, without

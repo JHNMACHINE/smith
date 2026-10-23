@@ -64,4 +64,5 @@ jobs:
           IMAGE="${IMAGE,,}"
           docker pull -q "$IMAGE"
           docker run --rm -e SMITH_BACKEND -e SMITH_BUILDER_TOKEN \
-            -v "$PWD/builder.py:/builder/builder.py:ro" "$IMAGE" python /builder/builder.py
+            -v "$PWD/builder.py:/builder/builder.py:ro" -v "$PWD/cache.py:/builder/cache.py:ro" \
+            "$IMAGE" python /builder/builder.py

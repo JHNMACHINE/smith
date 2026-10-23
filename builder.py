@@ -11,7 +11,7 @@ are part of the key a node looks it up by.
 dependencies, the wheels uv had to build from source there (``SMITH_CACHE =
 backend``). A node runs its owner's code, so nothing a node made can go where
 every other node reads: a wheel from a node is whatever that code wanted it to
-be. So the node reports a name - package, version, its ``ravex cache key
+be. So the node reports a name - package, version, its ``cache.py key
 --name wheels`` - and this compiles the package again from the sdist PyPI
 publishes, checked against the SHA-256 PyPI publishes for it.
 
@@ -26,13 +26,13 @@ publishes, checked against the SHA-256 PyPI publishes for it.
    the key's GPUs only (``TORCH_CUDA_ARCH_LIST``, ``FLASH_ATTN_CUDA_ARCHS``),
    as many compilations at once as the memory holds: one nvcc of flash-attn
    takes 6.5 GB (GPU-202);
-4. puts the wheel and the key in the cache with ``ravex cache``'s own push,
+4. puts the wheel and the key in the cache with ``cache.py``'s own push,
    through URLs the backend signs for this build alone;
 5. tells the backend how it ended.
 
 ``SMITH_BACKEND`` is the backend, ``SMITH_BUILDER_TOKEN`` its builder token -
-not an agent's: it may write what no node may. Standard library and the
-image's ravex only.
+not an agent's: it may write what no node may. Standard library and
+``cache.py`` beside it only.
 """
 
 from __future__ import annotations
@@ -140,7 +140,7 @@ def arch_env(gpus: List[str]) -> Dict[str, str]:
 
 def build(item: Dict[str, Any], work: str) -> str:
     """The wheel of ``item``, in ``work/out``; its file name."""
-    from ravex import _cache
+    import cache as _cache
 
     key = item["key"]
     mine = _cache.compute_key("wheels", gpus=key["gpus"])
@@ -205,7 +205,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     with tempfile.TemporaryDirectory() as work:
         try:
             wheel = build(item, work)
-            from ravex import _cache
+            import cache as _cache
 
             store = _cache.SignedStore("%s/api/cache-builds/%d/sign" % (os.environ["SMITH_BACKEND"].rstrip("/"), item["id"]),
                                        os.environ["SMITH_BUILDER_TOKEN"])

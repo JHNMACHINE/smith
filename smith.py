@@ -92,9 +92,11 @@ uv builds from source - flash-attn takes from minutes to hours - and the
 kernels Triton, Inductor and TileLang compile on first use go to directories
 under ``runs/_cache``, so the next job on this machine finds them. A job that
 brings its owner's own bucket also takes them from ``_cache`` there before it
-starts and sends back what it added: ``ravex cache``, run with the job's own
-interpreter, decides whether what is stored was built for a machine like this
-one, and loads nothing otherwise. Never with this agent's bucket: on a rented
+starts and sends back what it added: ``cache.py``, beside this file and run
+with the job's own interpreter, decides whether what is stored was built for a
+machine like this one, and loads nothing otherwise. It was ``ravex cache``
+until the cache, which is the node's work and not the run's, moved here
+(GPU-267). Never with this agent's bucket: on a rented
 node that is the platform's, shared by everybody, and a cache that every node
 may write is a way to run code on the others' machines. A cache that fails
 is said in the job's output and costs nothing but the compilation.
@@ -115,7 +117,7 @@ reach no further than its owner's own cache.
 The ``global`` part is filled by the backend's builder (``builder.py``,
 GPU-202), never by a node. After the install this machine reports, by name,
 the wheels uv still had to compile; the builder compiles them again from
-PyPI's source for this machine's ``ravex cache key --name wheels``, and the
+PyPI's source for this machine's ``cache.py key --name wheels``, and the
 next machine like this one pulls them as ``wheels`` and hands them to uv with
 ``--find-links``, where a wheel wins over the sdist of the same version.
 
@@ -187,6 +189,12 @@ TIMEOUT = 10.0
 #: of a moving tag otherwise looks exactly like one that did not.
 IMAGE = os.environ.get("SMITH_IMAGE", "").strip()
 
+#: The cache of compiled wheels and kernels (``cache.py``), run as a script
+#: with whichever interpreter's key it is: the job's, or this agent's for the
+#: wheels its environment is built from. By path, because the job's
+#: interpreter cannot import it - it is not installed anywhere.
+CACHE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.py")
+
 #: The compiled directories a job keeps, by name in the cache: the variable
 #: that points the tool at it, and the library whose version is part of what
 #: the files were built for. ``uv`` is the wheels it built from source, which
@@ -229,7 +237,7 @@ for name, directory, library in spec["caches"]:
                         shutil.copy2(path, target)
                 except OSError:
                     continue
-    subprocess.run([spec["python"], "-m", "ravex._cli", "cache", "push", "--name", name,
+    subprocess.run([spec["python"], spec["cache_script"], "push", "--name", name,
                     "--dir", source, "--store", spec["store"], "--with", library],
                    stdin=subprocess.DEVNULL)
     if source != directory:
@@ -358,14 +366,14 @@ import base64, json, os, shutil, signal, subprocess, sys, time, tomllib, urllib.
 began = time.monotonic()
 spec = json.loads(os.environ.pop("SMITH_PREPARE"))
 token = os.environ.pop("SMITH_GIT_TOKEN", "")
-# The cache's credentials go to `ravex cache` and not into the training's
+# The cache's credentials go to `cache.py` and not into the training's
 # environment, where a library that reports the environment would carry them
 # off. A boundary they are not: the training runs as this process's user and
 # can read them all the same, and the backend's token is in its environment
 # for the metrics anyway (GPU-200).
-cache_env = {name: os.environ.pop(name) for name in ("RAVEX_CACHE_ACCESS_KEY", "RAVEX_CACHE_SECRET_KEY",
-                                                       "RAVEX_CACHE_ENDPOINT", "RAVEX_CACHE_REGION",
-                                                       "RAVEX_CACHE_PATH_STYLE", "RAVEX_CACHE_TOKEN")
+cache_env = {name: os.environ.pop(name) for name in ("SMITH_CACHE_ACCESS_KEY", "SMITH_CACHE_SECRET_KEY",
+                                                       "SMITH_CACHE_ENDPOINT", "SMITH_CACHE_REGION",
+                                                       "SMITH_CACHE_PATH_STYLE", "SMITH_CACHE_TOKEN")
              if name in os.environ}
 
 
@@ -396,7 +404,7 @@ def cache(action, python, names):
             if name not in names:
                 continue
             since = time.monotonic()
-            done = subprocess.run([python, "-m", "ravex._cli", "cache", action, "--name", name, "--dir", directory,
+            done = subprocess.run([python, spec["cache_script"], action, "--name", name, "--dir", directory,
                                    "--store", store, "--with", library],
                                   stdin=subprocess.DEVNULL, env=dict(os.environ, **cache_env))
             if done.returncode != 0:
@@ -414,7 +422,7 @@ def wheels_pull():
     if not spec["wheels_store"]:
         return
     since = time.monotonic()
-    done = subprocess.run([sys.executable, "-m", "ravex._cli", "cache", "pull", "--name", "wheels",
+    done = subprocess.run([sys.executable, spec["cache_script"], "pull", "--name", "wheels",
                            "--dir", spec["wheels"], "--store", spec["wheels_store"]],
                           stdin=subprocess.DEVNULL, env=dict(os.environ, **cache_env))
     if done.returncode != 0:
@@ -443,12 +451,12 @@ def wheels_report():
     if not built:
         return
     try:
-        key = json.loads(subprocess.run([sys.executable, "-m", "ravex._cli", "cache", "key", "--name", "wheels"],
+        key = json.loads(subprocess.run([sys.executable, spec["cache_script"], "key", "--name", "wheels"],
                                         stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True).stdout)
         body = json.dumps({"key": key, "wheels": [{"name": n, "version": v} for n, v in sorted(built)]}).encode()
         request = urllib.request.Request(spec["wheels_report"], data=body, method="POST", headers={
             "Content-Type": "application/json", "User-Agent": "smith",
-            "Authorization": "Bearer " + cache_env.get("RAVEX_CACHE_TOKEN", "")})
+            "Authorization": "Bearer " + cache_env.get("SMITH_CACHE_TOKEN", "")})
         with urllib.request.urlopen(request, timeout=30) as response:
             answer = json.loads(response.read().decode() or "{}")
         for wheel in answer.get("queued", []):
@@ -1056,19 +1064,19 @@ class Running:
             self.cache_store = signed + "workspace"
             self.wheels_store = signed + "global"
             self.wheels_report = "%s/api/cache-builds" % config.backend
-            self.cache_env = {"RAVEX_CACHE_TOKEN": config.token}
+            self.cache_env = {"SMITH_CACHE_TOKEN": config.token}
             env.update(self.cache_env)
-        # Not with temporary keys: Ravex's cache signs with permanent ones
-        # only, and keys scoped to the runs' prefix would not reach _cache.
+        # Not with temporary keys: a backend hands them scoped to the runs'
+        # prefix, and they would not reach _cache.
         elif self.code is not None and own is not None and own.access_key and own.secret_key and not own.session_token:
             self.cache_store = "s3://%s/%s" % (own.bucket, own.prefix_of("_cache"))
             self.cache_reads = [self.cache_store]
-            self.cache_env = {"RAVEX_CACHE_ACCESS_KEY": own.access_key, "RAVEX_CACHE_SECRET_KEY": own.secret_key}
+            self.cache_env = {"SMITH_CACHE_ACCESS_KEY": own.access_key, "SMITH_CACHE_SECRET_KEY": own.secret_key}
             if own.endpoint:
-                self.cache_env["RAVEX_CACHE_ENDPOINT"] = str(own.endpoint)
+                self.cache_env["SMITH_CACHE_ENDPOINT"] = str(own.endpoint)
             if own.region:
-                self.cache_env["RAVEX_CACHE_REGION"] = str(own.region)
-            self.cache_env["RAVEX_CACHE_PATH_STYLE"] = "true" if own.path_style else "false"
+                self.cache_env["SMITH_CACHE_REGION"] = str(own.region)
+            self.cache_env["SMITH_CACHE_PATH_STYLE"] = "true" if own.path_style else "false"
             env.update(self.cache_env)
         env["RAVEX_METRICS_ENDPOINT"] = config.backend
         if config.token:
@@ -1203,6 +1211,7 @@ class Running:
                     "launcher_file": launcher,
                     "flags": flags(job.get("params") or {}),
                     "caches": self.caches,
+                    "cache_script": CACHE_SCRIPT,
                     "cache_reads": self.cache_reads,
                     "cache_store": self.cache_store,
                     "wheels": self.wheels,
@@ -1328,7 +1337,8 @@ class Running:
         except (OSError, ValueError, KeyError):
             return None
         kernels = [entry for entry in self.caches if entry[0] != "uv"]
-        spec: Dict[str, Any] = {"python": python, "store": self.cache_store, "caches": kernels}
+        spec: Dict[str, Any] = {"python": python, "store": self.cache_store, "caches": kernels,
+                                "cache_script": CACHE_SCRIPT}
         if settled:
             spec["settled"] = settled
         extra: Dict[str, Any] = {}
