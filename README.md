@@ -9,7 +9,12 @@ from the `[scripts]` table of smith's own configuration, and its parameters beco
 `--name value` flags. `smith.py` explains the rest — environment, tokens, where a
 run's store lives, stopping, and what happens to metrics a run could not send.
 
-Only the standard library, Python 3.11 or newer.
+Only the standard library, Python 3.11 or newer. Three files: `smith.py`, the
+agent; `cache.py`, the cache of compiled wheels and kernels, which smith runs as
+a script with the job's own interpreter (it was `ravex cache` until Ravex
+0.8.0; a bucket store goes through `moonclip.Bucket`, which the job's
+environment has); and `builder.py`, which compiles for that cache what nodes
+reported having had to compile.
 
 ## Running it
 
@@ -27,7 +32,7 @@ Moonclip and Ravex from one of two places:
 # From PyPI, at MOONCLIP_VERSION / RAVEX_VERSION: this repository alone.
 docker build -t smith .
 
-# Compiled from checkouts, for a Ravex that is ahead of PyPI.
+# Built from checkouts, for a Ravex or a Moonclip ahead of PyPI.
 docker build -t smith --build-arg LIBS=source \
   --build-context moonclip=../moonclip --build-context ravex=../ravex .
 ```
