@@ -62,8 +62,9 @@ the local directory only as Moonclip's staging copy. A rented node
 is gone once it stops; a store in the bucket is what lets "Resume" and "Fork"
 work on another one. The run reports ``s3://bucket/prefix`` as its address,
 and a resume or fork on any agent with the same bucket starts from there. The
-bucket's keys come from the environment, ``RAVEX_S3_ACCESS_KEY`` and
-``RAVEX_S3_SECRET_KEY``, never from this file; the jobs inherit them.
+bucket's keys come from the environment, ``MOONCLIP_S3_ACCESS_KEY`` and
+``MOONCLIP_S3_SECRET_KEY``, never from this file; the jobs inherit them, and
+Moonclip, which writes the store, reads them there (GPU-267).
 
 **The token.** ``SMITH_TOKEN`` in the environment (or ``token`` in the
 configuration, for a machine where that is how secrets arrive): sent as a
@@ -665,7 +666,7 @@ class Bucket:
     region: Optional[str] = None
     path_style: bool = False
     #: The bucket's own keys, when a backend handed one with a job. Unset,
-    #: the run takes this agent's RAVEX_S3_* from the environment. Out of
+    #: the run takes this agent's MOONCLIP_S3_* from the environment. Out of
     #: the repr, so that printing a bucket never prints them.
     access_key: Optional[str] = field(default=None, repr=False)
     secret_key: Optional[str] = field(default=None, repr=False)
@@ -705,7 +706,7 @@ class Bucket:
             raise SystemExit("storage in %s names no bucket" % path)
         if kind == "r2" and not table.get("endpoint"):
             raise SystemExit("storage in %s is r2 and has no endpoint" % path)
-        for name in ("RAVEX_S3_ACCESS_KEY", "RAVEX_S3_SECRET_KEY"):
+        for name in ("MOONCLIP_S3_ACCESS_KEY", "MOONCLIP_S3_SECRET_KEY"):
             # Said now, not by the first job to fail on it.
             if not os.environ.get(name):
                 raise SystemExit("storage in %s is a bucket, but %s is not set" % (path, name))
@@ -728,7 +729,8 @@ class Bucket:
         return uri[len(head):].strip("/") or None if uri.startswith(head) else None
 
     def environment(self, prefix: str) -> Dict[str, str]:
-        """What Ravex needs to keep a store under ``prefix`` in this bucket."""
+        """What a run needs to keep a store under ``prefix`` in this bucket:
+        where it is for Ravex, the keys for Moonclip, which reads them itself."""
         env = {
             "RAVEX_STORAGE_TYPE": self.type,
             "RAVEX_STORAGE_BUCKET": self.bucket,
@@ -740,10 +742,10 @@ class Bucket:
         if self.region:
             env["RAVEX_STORAGE_REGION"] = str(self.region)
         if self.access_key and self.secret_key:
-            env["RAVEX_S3_ACCESS_KEY"] = self.access_key
-            env["RAVEX_S3_SECRET_KEY"] = self.secret_key
+            env["MOONCLIP_S3_ACCESS_KEY"] = self.access_key
+            env["MOONCLIP_S3_SECRET_KEY"] = self.secret_key
             if self.session_token:
-                env["RAVEX_S3_SESSION_TOKEN"] = self.session_token
+                env["MOONCLIP_S3_SESSION_TOKEN"] = self.session_token
         return env
 
 
@@ -822,15 +824,17 @@ def redact(text: str, secrets: Dict[str, str]) -> str:
 
 def job_secrets(job: Dict[str, Any]) -> Dict[str, str]:
     """The secrets a backend gave this job: names and values for its
-    process's environment. A name smith sets itself is dropped rather than
-    let a secret replace the run's own settings."""
+    process's environment. A name smith sets itself, or one the libraries
+    under the run read their settings from, is dropped rather than let a
+    secret replace the run's own settings: a ``MOONCLIP_S3_*`` secret would
+    send the run's checkpoints to another bucket."""
     given = job.get("secrets")
     if not isinstance(given, dict):
         return {}
     return {
         str(name): str(value)
         for name, value in given.items()
-        if not str(name).startswith(("RAVEX_", "SMITH_"))
+        if not str(name).startswith(("RAVEX_", "SMITH_", "MOONCLIP_"))
     }
 
 

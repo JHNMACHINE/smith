@@ -3,7 +3,7 @@
 # One file for every node: what differs between them - the backend's address,
 # the node's name and card, the bucket - comes from the environment (see
 # smith.py), and so do the secrets, which never go in a file:
-# SMITH_TOKEN, RAVEX_S3_ACCESS_KEY, RAVEX_S3_SECRET_KEY.
+# SMITH_TOKEN, MOONCLIP_S3_ACCESS_KEY, MOONCLIP_S3_SECRET_KEY.
 
 backend = "http://127.0.0.1:8600"
 # What a job asks for to land here. Set SMITH_HARDWARE to the card -

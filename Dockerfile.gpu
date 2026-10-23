@@ -18,7 +18,7 @@
 #     -e SMITH_BACKEND=https://... -e SMITH_TOKEN=... \
 #     -e SMITH_HARDWARE=gpu-a100 \
 #     -e SMITH_STORAGE_BUCKET=... -e SMITH_STORAGE_ENDPOINT=https://<account>.r2.cloudflarestorage.com \
-#     -e RAVEX_S3_ACCESS_KEY=... -e RAVEX_S3_SECRET_KEY=... \
+#     -e MOONCLIP_S3_ACCESS_KEY=... -e MOONCLIP_S3_SECRET_KEY=... \
 #     smith-gpu
 #
 # Either way the libraries arrive as wheels made in a stage of their own, so

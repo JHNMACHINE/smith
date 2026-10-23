@@ -52,7 +52,7 @@ JSON over HTTP, with `Authorization: Bearer <SMITH_TOKEN>` when a token is set:
 
 A claimed job may carry `secrets`, an object of names and values - an
 `HF_TOKEN`, a W&B key. smith puts them in that job's process environment only,
-never its own, and never one named `RAVEX_*` or `SMITH_*`; and it replaces
+never its own, and never one named `RAVEX_*`, `SMITH_*` or `MOONCLIP_*`; and it replaces
 their values with `[secret NAME]` in the output lines and failure messages it
 sends back.
 
@@ -60,7 +60,7 @@ A claimed job may also carry `storage`, a bucket with its keys
 (`type`, `bucket`, `prefix`, `endpoint`, `region`, `path_style`, `access_key`,
 `secret_key`, and `session_token` when the keys are temporary ones): that
 job's store goes there instead of the agent's own bucket, the keys reach only
-its process (as `RAVEX_S3_*`), and they are kept out of what is sent back like
+its process (as `MOONCLIP_S3_*`), and they are kept out of what is sent back like
 secrets.
 
 A claimed job that is one node's part of a run trained on several (Ravex's
@@ -92,7 +92,8 @@ and ships what a finished run could not send with `ravex ship`.
 On a node, what differs between machines comes from the environment:
 `SMITH_BACKEND`, `SMITH_TOKEN`, `SMITH_NAME`,
 `SMITH_HARDWARE`, `SMITH_GPUS`, `SMITH_STORAGE_*`, and the
-bucket's `RAVEX_S3_ACCESS_KEY` / `RAVEX_S3_SECRET_KEY`.
+bucket's `MOONCLIP_S3_ACCESS_KEY` / `MOONCLIP_S3_SECRET_KEY`, which Moonclip
+reads itself.
 `SMITH_IMAGE`, which the GPU image sets to its own tag, is written as the first
 line of every job's output: `[smith] image ghcr.io/.../smith-gpu:<commit>`.
 
