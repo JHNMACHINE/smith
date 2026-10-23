@@ -49,7 +49,7 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PATH="/root/.cargo/bin:${PATH}"
 
-# The version both libraries pin in their rust-toolchain.toml (see Dockerfile).
+# The version Moonclip pins in its rust-toolchain.toml (see Dockerfile).
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --component clippy \
     && pip install maturin
@@ -59,10 +59,9 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/src/moonclip/target \
     maturin build --release --locked -m /src/moonclip/Cargo.toml --out /wheels
 
+# Ravex is pure Python since GPU-267: a plain wheel, no cargo.
 COPY --from=ravex . /src/ravex
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/src/ravex/target \
-    maturin build --release --locked -m /src/ravex/Cargo.toml --out /wheels \
+RUN pip wheel --no-deps --wheel-dir /wheels /src/ravex \
     && cp -r /src/ravex/examples /examples && cp -r /src/ravex/bench /bench
 
 FROM wheels-${LIBS} AS wheels

@@ -11,7 +11,7 @@
 #
 #   docker build -t smith --build-arg LIBS=source \
 #       --build-context moonclip=../moonclip --build-context ravex=../ravex .
-#       compiled from checkouts, for a Ravex that is ahead of PyPI.
+#       built from checkouts, for a Ravex that is ahead of PyPI.
 #
 # BuildKit builds only the stage LIBS names, so the default build never asks
 # for the two contexts.
@@ -53,10 +53,11 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 RUN apt-get update -qq \
     && apt-get install -y -qq --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
-# The version both libraries pin in their rust-toolchain.toml. Naming another
-# one here only makes rustup fetch a second compiler to satisfy that file - and
-# clippy is installed now because that file asks for it, and a component added
-# lazily while maturin runs cargo can race itself.
+# For Moonclip, the version its rust-toolchain.toml pins (Ravex is pure Python
+# since GPU-267). Naming another one here only makes rustup fetch a second
+# compiler to satisfy that file - and clippy is installed now because that file
+# asks for it, and a component added lazily while maturin runs cargo can race
+# itself.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --component clippy
 # Moonclip before Ravex, and each in its own layer, so a change in one does
@@ -67,9 +68,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/src/moonclip/target \
     pip install /src/moonclip
 COPY --from=ravex . /src/ravex
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/src/ravex/target \
-    pip install /src/ravex \
+RUN pip install /src/ravex \
     && mkdir -p /app && cp -r /src/ravex/examples /app/examples
 
 # ─── smith ─────────────────────────────────────────────────────────────
